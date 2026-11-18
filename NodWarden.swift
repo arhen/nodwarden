@@ -24,6 +24,11 @@ struct SSHInfo: Equatable {
     /// Executable name from the kernel, a hint: the requester can't fake its path,
     /// but it can still be any program you run.
     let app: String
+    /// Set when the request was forwarded from another host (`ssh -A`): it was made
+    /// there, not by `app`.
+    var via: String? = nil
+    /// Whether the core would remember an "Allow N minutes" for this request.
+    var canRemember = true
 }
 
 enum VaultState: Equatable { case starting, connecting, locked, unlocked, offline(String) }
@@ -259,10 +264,14 @@ final class Core: ObservableObject {
             let title = host.map { h in user.map { "\($0)@\(h)" } ?? h }
                 ?? (purpose == "git signing" ? "Git commit" : "SSH signature")
             let key = e["key"] as? String ?? "SSH key"
+            let via = (e["via"] as? [String])?.first
+            // The hop goes first: the line is cut at the end when it's too long.
+            let detail = (via.map { ["forwarded from \($0)"] } ?? []) + [key, purpose, app]
             queue.append(CredRequest(
-                id: id, title: title, detail: "\(key)  ·  \(purpose)  ·  \(app)", device: app,
+                id: id, title: title, detail: detail.joined(separator: "  ·  "), device: app,
                 arrived: Date(), timeout: e["timeout"] as? Double ?? 110,
-                ssh: SSHInfo(key: key, purpose: purpose, app: app)))
+                ssh: SSHInfo(key: key, purpose: purpose, app: app, via: via,
+                             canRemember: e["can_allow"] as? Bool ?? false)))
             NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
         case "resolved":
             guard let id = e["id"] as? Int else { return }
@@ -679,27 +688,31 @@ struct IslandView: View {
             HStack(spacing: 8) {
                 Button("Deny") { cancelPrompt(); core.decide(r, "deny") }.buttonStyle(Pill(.quiet))
                 Spacer(minLength: 0)
-                HStack(spacing: 0) {
-                    Button { cancelPrompt(); approve(r, minutes: minutes) } label: {
-                        HStack(spacing: 4) {
-                            Text("Allow")
-                            Text("\(minutes)m").contentTransition(.numericText(value: Double(minutes)))
+                // Offered only when it would be remembered: not for git signing, unverified
+                // data or a forwarded request, which the core asks about every time.
+                if r.ssh?.canRemember ?? true {
+                    HStack(spacing: 0) {
+                        Button { cancelPrompt(); approve(r, minutes: minutes) } label: {
+                            HStack(spacing: 4) {
+                                Text("Allow")
+                                Text("\(minutes)m").contentTransition(.numericText(value: Double(minutes)))
+                            }
                         }
-                    }
-                        .buttonStyle(Pill(.quiet, flat: true))
-                        .accessibilityLabel("Allow for \(minutes) minutes")
-                    Button {
-                        let steps = [5, 10, 30, 60]
-                        withAnimation(springSwap) {
-                            minutes = steps[((steps.firstIndex(of: minutes) ?? 1) + 1) % steps.count]
+                            .buttonStyle(Pill(.quiet, flat: true))
+                            .accessibilityLabel("Allow for \(minutes) minutes")
+                        Button {
+                            let steps = [5, 10, 30, 60]
+                            withAnimation(springSwap) {
+                                minutes = steps[((steps.firstIndex(of: minutes) ?? 1) + 1) % steps.count]
+                            }
+                        } label: {
+                            Image(systemName: "chevron.up.chevron.down").font(.system(size: 10, weight: .bold))
                         }
-                    } label: {
-                        Image(systemName: "chevron.up.chevron.down").font(.system(size: 10, weight: .bold))
+                        .buttonStyle(Pill(.quiet, flat: true, compact: true))
+                        .accessibilityLabel("Change auto-allow duration")
                     }
-                    .buttonStyle(Pill(.quiet, flat: true, compact: true))
-                    .accessibilityLabel("Change auto-allow duration")
+                    .background(.white.opacity(0.14), in: Capsule())
                 }
-                .background(.white.opacity(0.14), in: Capsule())
                 AllowButton(waiting: confirming, filled: granted == r.id) { approve(r, minutes: nil) }
             }
         }
@@ -777,9 +790,12 @@ struct IslandView: View {
             switch s.purpose {
             case "login": target = "log in to \(r.title) with \(s.key)"
             case "git signing": target = "sign a git commit with \(s.key)"
-            default: target = "sign \(s.purpose) with \(s.key)"
+            case "unverified data": target = "sign unverified data with \(s.key)"
+            default: target = "use \(s.key) for \(s.purpose)"
             }
-            what = m.map { "let \(s.app) \(target) for \($0) minutes" } ?? "let \(s.app) \(target)"
+            // A forwarded request was made on the other host; the local program only relays it.
+            let who = s.via.map { "a program on \($0)" } ?? s.app
+            what = m.map { "let \(who) \(target) for \($0) minutes" } ?? "let \(who) \(target)"
         } else {
             what = m.map { "allow \(r.title) for \(r.device) for \($0) minutes" } ?? "release \(r.title) to \(r.device)"
         }
@@ -1110,6 +1126,14 @@ func snapshot(to dir: String) {
         $0.queue = [CredRequest(id: 2, title: "git@github.com", detail: "Personal Github Key  ·  login  ·  ssh",
                                 device: "ssh", arrived: Date(), timeout: 110,
                                 ssh: SSHInfo(key: "Personal Github Key", purpose: "login", app: "ssh"))]
+    }
+    shot("3d-ssh-forwarded", waiting: true) {
+        $0.state = .unlocked
+        $0.queue = [CredRequest(id: 3, title: "git@github.com",
+                                detail: "forwarded from build.example.com  ·  Personal Github Key  ·  login  ·  ssh",
+                                device: "ssh", arrived: Date(), timeout: 110,
+                                ssh: SSHInfo(key: "Personal Github Key", purpose: "login", app: "ssh",
+                                             via: "build.example.com", canRemember: false))]
     }
     shot("3b-touched", granted: 1, waiting: true) { $0.state = .unlocked; $0.queue = [sample] }
     shot("4-queue") { $0.state = .unlocked; $0.queue = [sample, sample] }

@@ -13,6 +13,9 @@
 //!   else is "unverified data".
 //! - Program: the peer's executable path from the kernel (`proc_pidpath` of the
 //!   pid from `LOCAL_PEERPID`), not argv[0]. Shown as a hint.
+//! - Forwarding: a connection that `ssh -A` forwarded from another host says so
+//!   (a forwarding `session-bind`). The request then comes from that host, not
+//!   from the local program, so the hop is shown and no Allow window applies.
 
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
@@ -83,9 +86,18 @@ pub struct SignAsk {
     /// The program that connected, and its ancestors (nearest first), as a hint.
     pub peer: Option<Peer>,
     pub chain: Vec<String>,
+    /// Hosts the request was forwarded through (`ssh -A`), nearest to this Mac first.
+    /// Not empty means the request was made on that host, not by `peer`.
+    pub via: Vec<String>,
     /// True when an Allow window already covers this; the loop only reports it.
     pub auto: bool,
     pub reply: oneshot::Sender<bool>,
+}
+
+impl SignAsk {
+    fn allow_key(&self) -> Option<AllowKey> {
+        allow_key(&self.fingerprint, &self.host, &self.purpose, &self.peer, &self.via)
+    }
 }
 
 /// What an Allow window covers: exactly what the user saw (#3).
@@ -95,6 +107,18 @@ struct AllowKey {
     host: Option<String>,
     purpose: String,
     peer: Peer,
+}
+
+/// Only a login by an identified local program can be covered by an Allow window (#3).
+/// A forwarded request is made by whoever controls the remote host, so it always asks.
+fn allow_key(fingerprint: &str, host: &Option<String>, purpose: &str, peer: &Option<Peer>, via: &[String]) -> Option<AllowKey> {
+    let peer = peer.as_ref()?;
+    (purpose == "login" && via.is_empty()).then(|| AllowKey {
+        fingerprint: fingerprint.to_owned(),
+        host: host.clone(),
+        purpose: purpose.to_owned(),
+        peer: peer.clone(),
+    })
 }
 
 #[derive(Default)]
@@ -183,11 +207,44 @@ pub async fn serve(state: Shared, asks: mpsc::Sender<SignAsk>) -> Result<(), Str
     }
 }
 
-/// Session state bound by a verified `session-bind@openssh.com`.
+/// Hops an agent connection may be forwarded through before binds are refused.
+const MAX_HOPS: usize = 8;
+
+/// One verified `session-bind@openssh.com`.
+struct SessionBind {
+    host: String,
+    session_id: Vec<u8>,
+    forwarding: bool,
+}
+
+/// What the verified binds on one connection say about it.
 #[derive(Default)]
 struct Bind {
+    /// The host a login on this connection is for.
     host: Option<String>,
     session_id: Vec<u8>,
+    /// Hosts this connection was forwarded through, nearest first.
+    via: Vec<String>,
+}
+
+impl Bind {
+    /// Same order as OpenSSH's own agent accepts: forwarding hops first, then at most one
+    /// bind for authentication. Nothing may be bound after that one.
+    fn add(&mut self, b: SessionBind) -> bool {
+        if !self.session_id.is_empty() {
+            return false;
+        }
+        if b.forwarding {
+            if self.via.len() >= MAX_HOPS {
+                return false;
+            }
+            self.via.push(b.host);
+        } else {
+            self.host = Some(b.host);
+            self.session_id = b.session_id;
+        }
+        true
+    }
 }
 
 async fn handle(mut s: UnixStream, state: Shared, asks: mpsc::Sender<SignAsk>) -> std::io::Result<()> {
@@ -207,13 +264,10 @@ async fn handle(mut s: UnixStream, state: Shared, asks: mpsc::Sender<SignAsk>) -
         let reply = match msg[0] {
             SSH2_AGENTC_REQUEST_IDENTITIES => identities(&state).await,
             SSH2_AGENTC_SIGN_REQUEST => sign(&mut s, &msg[1..], &state, &asks, pid, &bind).await,
-            SSH_AGENTC_EXTENSION => match session_bind(&msg[1..]) {
-                Some(b) => {
-                    bind = b;
-                    vec![SSH_AGENT_SUCCESS]
-                }
-                None => vec![SSH_AGENT_FAILURE],
-            },
+            SSH_AGENTC_EXTENSION => {
+                let bound = session_bind(&msg[1..]).is_some_and(|b| bind.add(b));
+                vec![if bound { SSH_AGENT_SUCCESS } else { SSH_AGENT_FAILURE }]
+            }
             _ => vec![SSH_AGENT_FAILURE],
         };
         let mut out = (reply.len() as u32).to_be_bytes().to_vec();
@@ -297,11 +351,7 @@ async fn sign(
         None => (None, Vec::new()),
     };
 
-    // Only a fully identified login can be covered by an Allow window (#3).
-    let allow_key = match (&peer, purpose.as_str()) {
-        (Some(p), "login") => Some(AllowKey { fingerprint: fingerprint.clone(), host: host.clone(), purpose: purpose.clone(), peer: p.clone() }),
-        _ => None,
-    };
+    let allow_key = allow_key(&fingerprint, &host, &purpose, &peer, &bind.via);
     let auto = match &allow_key {
         Some(k) => {
             let mut st = state.lock().await;
@@ -322,7 +372,7 @@ async fn sign(
         *w += 1;
     }
     let (tx, rx) = oneshot::channel();
-    let ask = SignAsk { key_name, fingerprint, host, user, purpose, peer, chain, auto, reply: tx };
+    let ask = SignAsk { key_name, fingerprint, host, user, purpose, peer, chain, via: bind.via.clone(), auto, reply: tx };
     let approved = if asks.send(ask).await.is_err() {
         false
     } else {
@@ -382,12 +432,9 @@ async fn peer_closed(sock: &UnixStream) {
 
 /// Remembers an approval for exactly what was shown. Unidentified requests are never cached.
 pub async fn allow_for(state: &Shared, ask: &SignAsk, until: Instant) {
-    let Some(peer) = &ask.peer else { return };
-    if ask.purpose != "login" {
-        return;
+    if let Some(key) = ask.allow_key() {
+        state.lock().await.allowed.insert(key, until);
     }
-    let key = AllowKey { fingerprint: ask.fingerprint.clone(), host: ask.host.clone(), purpose: ask.purpose.clone(), peer: peer.clone() };
-    state.lock().await.allowed.insert(key, until);
 }
 
 /// SSH wire signature: string(algorithm) + string(signature bytes).
@@ -429,7 +476,7 @@ fn make_signature(key: &PrivateKey, data: &[u8], flags: u32) -> Option<Vec<u8>> 
 
 /// `session-bind@openssh.com`: string hostkey, string session id, string signature, bool forwarding.
 /// Accepted only if the host key's signature over the session id verifies (#2).
-fn session_bind(body: &[u8]) -> Option<Bind> {
+fn session_bind(body: &[u8]) -> Option<SessionBind> {
     let mut rd = Reader(body);
     if rd.string()? != b"session-bind@openssh.com" {
         return None;
@@ -437,7 +484,10 @@ fn session_bind(body: &[u8]) -> Option<Bind> {
     let hostkey = rd.string()?;
     let session_id = rd.string()?;
     let sig = rd.string()?;
-    let _forwarding = rd.byte()?;
+    let forwarding = rd.byte()? != 0;
+    if session_id.is_empty() {
+        return None;
+    }
     let key = ssh_key::public::KeyData::decode(&mut hostkey.as_slice()).ok()?;
     let sig = ssh_key::Signature::decode(&mut sig.as_slice()).ok()?;
     {
@@ -445,7 +495,7 @@ fn session_bind(body: &[u8]) -> Option<Bind> {
         key.verify(&session_id, &sig).ok()?;
     }
     let fp = key.fingerprint(HashAlg::Sha256).to_string();
-    Some(Bind { host: Some(known_host_for(&fp).unwrap_or(fp)), session_id })
+    Some(SessionBind { host: known_host_for(&fp).unwrap_or(fp), session_id, forwarding })
 }
 
 /// Maps a verified host key fingerprint to a hostname via ~/.ssh/known_hosts (unhashed entries).
@@ -566,6 +616,9 @@ pub fn ask_json(id: u64, a: &SignAsk) -> Value {
         "host": a.host, "user": a.user, "purpose": a.purpose,
         "app": a.peer.as_ref().map(Peer::name), "app_path": a.peer.as_ref().map(|p| p.path.clone()),
         "process": a.chain,
+        "via": a.via,
+        // Whether "Allow N minutes" would be remembered; the UI offers it only then.
+        "can_allow": a.allow_key().is_some(),
         "timeout": crate::REQUEST_TIMEOUT.as_secs(),
     })
 }
@@ -621,7 +674,7 @@ mod tests {
         d.extend(s(b"git"));
         d.extend(s(b"ssh-connection"));
         d.extend(s(b"publickey"));
-        let bound = Bind { host: Some("github.com".into()), session_id: sid.clone() };
+        let bound = Bind { host: Some("github.com".into()), session_id: sid.clone(), via: Vec::new() };
         assert_eq!(classify(&d, &bound), ("login".into(), Some("github.com".into()), Some("git".into())));
         // The host-bound method modern OpenSSH actually sends.
         let mut hb = s(&sid);
@@ -631,46 +684,68 @@ mod tests {
         hb.extend(s(b"publickey-hostbound-v00@openssh.com"));
         assert_eq!(classify(&hb, &bound).0, "login");
         // Same data, but bound to another session: not a login for github.com.
-        let other = Bind { host: Some("github.com".into()), session_id: b"other".to_vec() };
+        let other = Bind { host: Some("github.com".into()), session_id: b"other".to_vec(), via: Vec::new() };
         assert_eq!(classify(&d, &other).0, "unverified data");
         // No bind at all.
         assert_eq!(classify(&d, &Bind::default()).0, "unverified data");
     }
 
+    fn host_key() -> ssh_key::PrivateKey {
+        ssh_key::PrivateKey::random(&mut rsa::rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap()
+    }
+
+    /// A `session-bind@openssh.com` body where host key `k` signs `signed` but claims `session_id`.
+    fn bind_body(k: &ssh_key::PrivateKey, session_id: &[u8], signed: &[u8], forwarding: bool) -> Vec<u8> {
+        use signature::Signer;
+        let mut hostkey = Vec::new();
+        k.public_key().key_data().encode(&mut hostkey).unwrap();
+        let sig: ssh_key::Signature = k.try_sign(signed).unwrap();
+        let mut sig_blob = Vec::new();
+        sig.encode(&mut sig_blob).unwrap();
+        let mut body = s(b"session-bind@openssh.com");
+        body.extend(s(&hostkey));
+        body.extend(s(session_id));
+        body.extend(s(&sig_blob));
+        body.push(forwarding as u8);
+        body
+    }
+
     #[test]
     fn forged_session_bind_rejected() {
         // A real ed25519 host key with a signature that does not cover the session id.
-        let k = ssh_key::PrivateKey::random(&mut rsa::rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
-        let mut hostkey = Vec::new();
-        k.public_key().key_data().encode(&mut hostkey).unwrap();
-        let sig = {
-            use signature::Signer;
-            let sig: ssh_key::Signature = k.try_sign(b"some other session").unwrap();
-            let mut v = Vec::new();
-            sig.encode(&mut v).unwrap();
-            v
-        };
-        let mut body = s(b"session-bind@openssh.com");
-        body.extend(s(&hostkey));
-        body.extend(s(b"the real session"));
-        body.extend(s(&sig));
-        body.push(0);
-        assert!(session_bind(&body).is_none());
-
+        let k = host_key();
+        assert!(session_bind(&bind_body(&k, b"the real session", b"some other session", false)).is_none());
         // Signed correctly: accepted.
-        let good = {
-            use signature::Signer;
-            let sig: ssh_key::Signature = k.try_sign(b"the real session").unwrap();
-            let mut v = Vec::new();
-            sig.encode(&mut v).unwrap();
-            v
-        };
-        let mut body = s(b"session-bind@openssh.com");
-        body.extend(s(&hostkey));
-        body.extend(s(b"the real session"));
-        body.extend(s(&good));
-        body.push(0);
-        assert_eq!(session_bind(&body).map(|b| b.session_id), Some(b"the real session".to_vec()));
+        let good = session_bind(&bind_body(&k, b"the real session", b"the real session", false)).unwrap();
+        assert_eq!(good.session_id, b"the real session");
+        assert!(!good.forwarding);
+        assert!(session_bind(&bind_body(&k, b"", b"", false)).is_none(), "empty session id");
+    }
+
+    #[test]
+    fn forwarded_connection_is_marked_and_never_remembered() {
+        // `ssh -A jump`, then on jump: `ssh git@github.com`. The local ssh binds the jump host
+        // as a forwarding hop; everything after that on the connection comes from the jump host.
+        let (jump, github) = (host_key(), host_key());
+        let mut bind = Bind::default();
+        let hop = session_bind(&bind_body(&jump, b"sid-jump", b"sid-jump", true)).unwrap();
+        assert!(hop.forwarding);
+        let jump_name = hop.host.clone();
+        assert!(bind.add(hop));
+        assert!(bind.session_id.is_empty(), "a forwarding hop is not a login session");
+        assert!(bind.add(session_bind(&bind_body(&github, b"sid-gh", b"sid-gh", false)).unwrap()));
+        assert_eq!(bind.via, [jump_name]);
+        assert_eq!(bind.session_id, b"sid-gh");
+        // Nothing may be bound after the bind for authentication.
+        assert!(!bind.add(session_bind(&bind_body(&jump, b"sid-3", b"sid-3", false)).unwrap()));
+        assert!(!bind.add(session_bind(&bind_body(&jump, b"sid-3", b"sid-3", true)).unwrap()));
+
+        let peer = Some(Peer { pid: 1, start: 1, path: "/usr/bin/ssh".into() });
+        let host = Some("github.com".to_string());
+        assert!(allow_key("SHA256:k", &host, "login", &peer, &[]).is_some());
+        assert!(allow_key("SHA256:k", &host, "login", &peer, &bind.via).is_none(), "forwarded login was remembered");
+        assert!(allow_key("SHA256:k", &None, "git signing", &peer, &[]).is_none());
+        assert!(allow_key("SHA256:k", &host, "login", &None, &[]).is_none());
     }
 
     #[test]
