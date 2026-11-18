@@ -1,6 +1,6 @@
 [package]
 name = "aac-core"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -26,3 +26,4 @@ ssh-key = { version = "0.6", features = ["ed25519", "rsa", "p256", "p384", "std"
 tokio = { version = "1.36", features = ["macros", "rt-multi-thread", "sync", "time", "io-std", "io-util", "process"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zeroize = "1"

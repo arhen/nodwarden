@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import LocalAuthentication
 import SwiftUI
 
@@ -6,78 +7,137 @@ import SwiftUI
 
 struct CredRequest: Identifiable, Equatable {
     let id: Int
-    let domain: String
-    let username: String?
+    /// What the request is for, as the user should read it: the item's own name for
+    /// credentials (#15), the verified host for SSH logins.
+    let title: String
+    /// Second line: username, host, "requested by id", etc.
+    let detail: String
     let device: String
-    let hasTotp: Bool
-    let byId: Bool
     let arrived: Date
     let timeout: Double
-    /// Set for SSH agent requests: key name, purpose, and calling program.
     var ssh: SSHInfo? = nil
 }
 
 struct SSHInfo: Equatable {
     let key: String
     let purpose: String
+    /// Executable name from the kernel, a hint: the requester can't fake its path,
+    /// but it can still be any program you run.
     let app: String
 }
 
-/// The program behind a request: the nearest named ancestor that isn't a shell.
-func requestingApp(_ chain: [String]) -> String {
-    let skip: Set<String> = ["ssh", "ssh-keygen", "git", "git-remote-https", "bash", "zsh", "sh", "fish", "login", "sudo", "env", "xargs"]
-    return chain.first { !skip.contains($0) } ?? chain.first ?? "unknown app"
-}
-
-enum VaultState: Equatable { case starting, locked, unlocked, offline(String) }
+enum VaultState: Equatable { case starting, connecting, locked, unlocked, offline(String) }
 
 enum Outcome: Equatable {
-    case approved(String), denied(String), auto(String), expired(String), notFound(String), locked(String)
+    case approved(String), denied(String), auto(String), expired(String), notFound(String), locked(String), cancelled(String)
 }
 
-/// launchd starts apps with a bare PATH. `bw` and `bwbio` are Node scripts, so
-/// node must be findable too. Set NODWARDEN_PATH to override.
-let toolPath: String = ProcessInfo.processInfo.environment["NODWARDEN_PATH"] ?? [
-    "\(NSHomeDirectory())/.n/bin", "\(NSHomeDirectory())/.volta/bin", "\(NSHomeDirectory())/.local/bin",
-    "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
-].joined(separator: ":")
+/// Absolute tool paths, resolved once (#4). PATH is only used to find them; anything in a
+/// directory other users can write is refused. Override the search with NODWARDEN_PATH.
+enum Tools {
+    static let searchPath: [String] = (ProcessInfo.processInfo.environment["NODWARDEN_PATH"] ?? [
+        "\(NSHomeDirectory())/.n/bin", "\(NSHomeDirectory())/.volta/bin", "\(NSHomeDirectory())/.local/bin",
+        "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
+    ].joined(separator: ":")).split(separator: ":").map(String.init)
+
+    static func find(_ name: String) -> String? {
+        for dir in searchPath {
+            let p = "\(dir)/\(name)"
+            guard FileManager.default.isExecutableFile(atPath: p) else { continue }
+            // Follow every symlink to the real file (e.g. ~/.n/bin/bw -> ../lib/.../bw.js).
+            let real = URL(fileURLWithPath: p).resolvingSymlinksInPath().path
+            guard FileManager.default.fileExists(atPath: real) else { return nil }
+            return sharedWritable(real) ? nil : real
+        }
+        return nil
+    }
+
+    /// True if the file or any parent directory is writable by group or others (sticky dirs excepted).
+    static func sharedWritable(_ path: String) -> Bool {
+        var url = URL(fileURLWithPath: path)
+        while url.path != "/" {
+            if let a = try? FileManager.default.attributesOfItem(atPath: url.path),
+               let mode = (a[.posixPermissions] as? NSNumber)?.intValue,
+               mode & 0o022 != 0, mode & 0o1000 == 0 {
+                return true
+            }
+            url.deleteLastPathComponent()
+        }
+        return false
+    }
+
+    static let node = find("node")
+    static let bw = find("bw")
+    static let bwbio = find("bwbio")
+
+    /// PATH handed to aac-core: only the directories the resolved tools live in.
+    static var childPath: String {
+        let dirs = [node, bw].compactMap { $0.map { URL(fileURLWithPath: $0).deletingLastPathComponent().path } }
+        var seen = Set<String>()
+        return (dirs + ["/usr/bin", "/bin"]).filter { seen.insert($0).inserted }.joined(separator: ":")
+    }
+}
 
 final class Core: ObservableObject {
     @Published var state: VaultState = .starting
     @Published var queue: [CredRequest] = []
     @Published var outcome: Outcome?
     @Published var unlocking = false
+    /// Last few log lines from aac-core, shown in the status panel (#19).
+    @Published var log: [String] = []
+    /// The reusable PSK token, when aac-core mints a new one (#19).
+    @Published var token: String?
 
     private var proc: Process?
     private var stdin: FileHandle?
     private var buffer = Data()
     private var outcomeWork: DispatchWorkItem?
+    private var restartDelay: TimeInterval = 1
 
     var corePath: String {
         Bundle.main.executableURL!.deletingLastPathComponent().appendingPathComponent("aac-core").path
     }
 
+    /// stderr of aac-core: ~/Library/Logs/NodWarden/aac-core.log, created 0600, never a symlink (#16).
+    static func openLog() -> FileHandle {
+        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/NodWarden")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let path = dir.appendingPathComponent("aac-core.log").path
+        let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        return fd >= 0 ? FileHandle(fileDescriptor: fd, closeOnDealloc: true) : FileHandle.nullDevice
+    }
+
     func start() {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: corePath)
-        // launchd gives a bare PATH; bw is a `#!/usr/bin/env node` script and needs node.
-        var env = ProcessInfo.processInfo.environment
-        env["PATH"] = toolPath
-        p.environment = env
+        p.environment = ["PATH": Tools.childPath, "HOME": NSHomeDirectory()]
         let inPipe = Pipe(), outPipe = Pipe()
         p.standardInput = inPipe
         p.standardOutput = outPipe
-        p.standardError = FileHandle(forWritingAtPath: "/tmp/aac-core.log") ?? FileHandle.nullDevice
+        p.standardError = Core.openLog()
+        buffer.removeAll()
         outPipe.fileHandleForReading.readabilityHandler = { [weak self] h in
             let d = h.availableData
-            guard !d.isEmpty else { return }
+            if d.isEmpty {
+                h.readabilityHandler = nil // EOF: stop the handler spinning (#8).
+                return
+            }
             DispatchQueue.main.async { self?.ingest(d) }
         }
-        p.terminationHandler = { [weak self] _ in
+        p.terminationHandler = { [weak self] proc in
             DispatchQueue.main.async {
-                self?.state = .offline("listener stopped")
-                self?.queue.removeAll()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self?.start() }
+                guard let self else { return }
+                self.stdin = nil
+                self.proc = nil
+                for r in self.queue { self.flash(.cancelled(r.title)) }
+                self.queue.removeAll()
+                if case .offline = self.state {} else {
+                    self.state = .offline(proc.terminationStatus == 0 ? "listener stopped" : "listener exited (\(proc.terminationStatus))")
+                }
+                // Back off up to a minute while offline (#8).
+                let delay = self.restartDelay
+                self.restartDelay = min(self.restartDelay * 2, 60)
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { self.start() }
             }
         }
         do { try p.run() } catch { state = .offline("cannot start aac-core"); return }
@@ -89,18 +149,20 @@ final class Core: ObservableObject {
         send(["op": "lock"])
         proc?.terminationHandler = nil
         proc?.terminate()
-        // Wipe the session-encrypted user key bwbio left in bw's data.json.
+        // Lock bw so a session copied from anywhere stops working.
+        guard let node = Tools.node, let bw = Tools.bw else { return }
         let lock = Process()
-        lock.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        lock.arguments = ["bw", "lock"]
-        lock.environment = ["PATH": toolPath]
+        lock.executableURL = URL(fileURLWithPath: node)
+        lock.arguments = [bw, "lock"]
+        lock.environment = ["HOME": NSHomeDirectory()]
         try? lock.run()
         lock.waitUntilExit()
     }
 
     private func send(_ obj: [String: Any]) {
         guard let stdin, let d = try? JSONSerialization.data(withJSONObject: obj) else { return }
-        stdin.write(d + Data([0x0A]))
+        // Throws instead of raising SIGPIPE on a dead pipe (#8).
+        try? stdin.write(contentsOf: d + Data([0x0A]))
     }
 
     private func ingest(_ d: Data) {
@@ -117,46 +179,51 @@ final class Core: ObservableObject {
         switch e["ev"] as? String {
         case "status":
             switch e["state"] as? String {
-            case "unlocked": state = .unlocked
-            case "locked": state = .locked
+            case "unlocked": state = .unlocked; restartDelay = 1
+            case "locked": state = .locked; restartDelay = 1
+            case "connecting": if state != .unlocked && state != .locked { state = .connecting }
+            case "listening": if state == .connecting || state == .starting { state = .locked }
             case "offline": state = .offline(e["detail"] as? String ?? "offline")
             default: break
             }
+        case "token":
+            token = e["token"] as? String
+        case "log":
+            if let m = e["msg"] as? String { log = Array((log + [m]).suffix(5)) }
         case "request":
             guard let id = e["id"] as? Int else { return }
-            let q = e["query"] as? String ?? "?"
-            let r = CredRequest(
-                id: id,
-                domain: (e["domain"] as? String) ?? q,
-                username: e["username"] as? String,
+            let name = e["name"] as? String ?? "item"
+            let domain = e["domain"] as? String
+            var parts = [e["username"] as? String ?? "no username"]
+            if let domain, domain.caseInsensitiveCompare(name) != .orderedSame { parts.append(domain) }
+            if e["has_totp"] as? Bool ?? false { parts.append("+ 2FA code") }
+            switch e["kind"] as? String {
+            case "id": parts.append("by id")
+            case "search": parts.append("by search")
+            default: break
+            }
+            queue.append(CredRequest(
+                id: id, title: name, detail: parts.joined(separator: "  ·  "),
                 device: e["device"] as? String ?? "unknown",
-                hasTotp: e["has_totp"] as? Bool ?? false,
-                byId: (e["kind"] as? String) == "id",
-                arrived: Date(),
-                timeout: e["timeout"] as? Double ?? 110
-            )
-            queue.append(r)
+                arrived: Date(), timeout: e["timeout"] as? Double ?? 110))
             NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
         case "ssh_request":
             guard let id = e["id"] as? Int else { return }
-            let chain = e["process"] as? [String] ?? []
-            let purpose = e["purpose"] as? String ?? "signing"
-            let r = CredRequest(
-                id: id,
-                domain: (e["host"] as? String) ?? (purpose == "git signing" ? "Git commit" : "SSH"),
-                username: nil,
-                device: "",
-                hasTotp: false,
-                byId: false,
-                arrived: Date(),
-                timeout: e["timeout"] as? Double ?? 110,
-                ssh: SSHInfo(key: e["key"] as? String ?? "SSH key", purpose: purpose, app: requestingApp(chain))
-            )
-            queue.append(r)
+            let purpose = e["purpose"] as? String ?? "unverified data"
+            let host = e["host"] as? String
+            let user = e["user"] as? String
+            let app = e["app"] as? String ?? "unknown program"
+            let title = host.map { h in user.map { "\($0)@\(h)" } ?? h }
+                ?? (purpose == "git signing" ? "Git commit" : "SSH signature")
+            let key = e["key"] as? String ?? "SSH key"
+            queue.append(CredRequest(
+                id: id, title: title, detail: "\(key)  ·  \(purpose)  ·  \(app)", device: app,
+                arrived: Date(), timeout: e["timeout"] as? Double ?? 110,
+                ssh: SSHInfo(key: key, purpose: purpose, app: app)))
             NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
         case "resolved":
             guard let id = e["id"] as? Int else { return }
-            let label = queue.first(where: { $0.id == id })?.domain
+            let label = queue.first(where: { $0.id == id })?.title
                 ?? (e["domain"] as? String) ?? (e["query"] as? String) ?? ""
             queue.removeAll { $0.id == id }
             switch e["outcome"] as? String {
@@ -166,6 +233,7 @@ final class Core: ObservableObject {
             case "expired": flash(.expired(label))
             case "not_found": flash(.notFound(label))
             case "locked": flash(.locked(label))
+            case "cancelled": flash(.cancelled(label))
             default: break
             }
         default: break
@@ -186,36 +254,49 @@ final class Core: ObservableObject {
         send(obj)
     }
 
-    /// Touch ID via Bitwarden Desktop. Tries the official `bw unlock` first (bw >= 2026.10
-    /// with the server's `biometrics-sdk-ipc` flag on), then `bwbio`. The session goes
-    /// straight into the listener's stdin; it never touches argv, env, or disk here.
+    /// Touch ID via Bitwarden Desktop. Tries the official `bw unlock` first, then `bwbio`.
+    /// The session goes straight into aac-core's stdin; never argv, env, or disk here.
     func unlock() {
         guard !unlocking else { return }
+        guard let node = Tools.node, Tools.bw != nil || Tools.bwbio != nil else {
+            log = Array((log + ["Touch ID unlock needs node and bw or bwbio"]).suffix(5))
+            return
+        }
         unlocking = true
+        let candidates = [Tools.bw, Tools.bwbio].compactMap { $0 }
         DispatchQueue.global().async {
-            let session = Core.touchIDSession(["bw", "unlock", "--raw"])
-                ?? Core.touchIDSession(["bwbio", "unlock", "--raw"])
+            var session: String?
+            for tool in candidates where session == nil {
+                session = Core.touchIDSession(node: node, script: tool)
+            }
             DispatchQueue.main.async {
                 self.unlocking = false
-                if let session { self.send(["op": "unlock", "session": session]) }
+                if let session {
+                    self.send(["op": "unlock", "session": session])
+                } else {
+                    self.log = Array((self.log + ["Touch ID unlock failed or was cancelled"]).suffix(5))
+                }
             }
         }
     }
 
-    /// Runs an unlock command with no terminal. With no Touch ID path, `bw` falls back to a
-    /// password prompt, reads EOF from /dev/null and prints nothing, so this returns nil.
-    static func touchIDSession(_ args: [String]) -> String? {
+    /// Runs `<tool> unlock --raw` with no terminal and a 60 s limit (#18). With no Touch ID
+    /// path, `bw` asks for a password, reads EOF from /dev/null and prints nothing: nil.
+    static func touchIDSession(node: String, script: String) -> String? {
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        p.arguments = args
-        p.environment = ["PATH": toolPath, "HOME": NSHomeDirectory()]
+        p.executableURL = URL(fileURLWithPath: node)
+        p.arguments = [script, "unlock", "--raw"]
+        p.environment = ["HOME": NSHomeDirectory(), "PATH": Tools.childPath]
         let out = Pipe()
         p.standardInput = FileHandle.nullDevice
         p.standardOutput = out
         p.standardError = FileHandle.nullDevice
         guard (try? p.run()) != nil else { return nil }
+        let killer = DispatchWorkItem { if p.isRunning { p.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 60, execute: killer)
         let data = out.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
+        killer.cancel()
         let s = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         // A bw session key is 64 random bytes, base64: 88 characters.
         return s.count == 88 && Data(base64Encoded: s) != nil ? s : nil
@@ -226,17 +307,19 @@ final class Core: ObservableObject {
 
 // MARK: - Presence check
 
-/// Approving with a click alone could be forged by anything with Accessibility
-/// access. Device-owner auth means the release needs a finger, not a mouse event.
-/// Returns the context so the caller can cancel a pending prompt (Deny, Allow 10m, timeout).
-@discardableResult
-func confirmPresence(_ reason: String, _ done: @escaping (Bool) -> Void) -> LAContext {
-    let ctx = LAContext()
+/// Biometrics only (#5): Touch ID or a paired Apple Watch, never the login password.
+/// A script with Accessibility access can click and type, but cannot touch the sensor.
+/// The caller creates the context first so it can recognise this exact prompt later (#7).
+func confirmPresence(_ ctx: LAContext, _ reason: String, _ done: @escaping (Bool) -> Void) {
     ctx.localizedFallbackTitle = ""
-    ctx.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { ok, _ in
+    var error: NSError?
+    guard ctx.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else {
+        DispatchQueue.main.async { done(false) }
+        return
+    }
+    ctx.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { ok, _ in
         DispatchQueue.main.async { done(ok) }
     }
-    return ctx
 }
 
 // MARK: - Geometry
@@ -259,7 +342,7 @@ struct Notch {
     }
 }
 
-enum Mode: Equatable { case hidden, compact, expanded }
+enum Mode: Equatable { case compact, expanded }
 
 /// Notch-fused silhouette: flush top edge, small concave shoulders where it
 /// meets the bezel, large continuous corners at the bottom.
@@ -315,7 +398,8 @@ extension AnyTransition {
 }
 
 final class Layout: ObservableObject {
-    var size: CGSize = .zero
+    var size: CGSize = .zero { didSet { if size != oldValue { onResize?() } } }
+    var onResize: (() -> Void)?
     /// Set by the panel: a click landed outside the island, or Esc was pressed.
     @Published var dismissTick = 0
 }
@@ -327,8 +411,12 @@ struct IslandView: View {
     @State private var pinned: Bool
     @State private var minutes = 10
     @State private var confirming = false
-    /// The Touch ID prompt for the request on screen, started as soon as it arrives.
-    @State private var prompt: (id: Int, ctx: LAContext)?
+    /// The live Touch ID prompt. Identified by its context, not the request id, so a
+    /// cancelled prompt's late callback can't clear a newer one (#7).
+    @State private var prompt: LAContext?
+    /// When the request on screen was shown; Allow is ignored for a moment after a queue
+    /// advance so one touch can't approve the next request by accident (#14).
+    @State private var shownAt = Date.distantPast
     /// Request whose Touch ID just succeeded; drives the red fill.
     @State private var granted: Int?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -359,7 +447,6 @@ struct IslandView: View {
 
     var size: CGSize {
         switch mode {
-        case .hidden: return CGSize(width: notch.width, height: notch.height)
         case .compact: return CGSize(width: max(notch.width, 120) + ear * 2, height: notch.height)
         case .expanded:
             return CGSize(width: max(notch.width + 200, 440), height: notch.height + (current != nil ? 106 : 104))
@@ -369,7 +456,7 @@ struct IslandView: View {
     var body: some View {
         VStack(spacing: 0) {
             ZStack(alignment: .top) {
-                IslandShape(top: mode == .hidden ? 6 : 8, bottom: mode == .expanded ? 30 : 12)
+                IslandShape(top: 8, bottom: mode == .expanded ? 30 : 12)
                     .fill(.black)
                     .shadow(color: .black.opacity(mode == .expanded ? 0.45 : 0), radius: 18, y: 8)
 
@@ -390,7 +477,7 @@ struct IslandView: View {
             Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .animation(reduceMotion ? .easeOut(duration: 0.18) : (mode == .hidden ? springClose : springOpen), value: mode)
+        .animation(reduceMotion ? .easeOut(duration: 0.18) : (mode == .compact ? springClose : springOpen), value: mode)
         .animation(reduceMotion ? .easeOut(duration: 0.18) : springOpen, value: current?.id)
         .environment(\.colorScheme, .dark)
         .onAppear { layout.size = size }
@@ -398,14 +485,17 @@ struct IslandView: View {
         .onChange(of: layout.dismissTick) { _, _ in
             if pinned { withAnimation(springClose) { pinned = false } }
         }
-        .onChange(of: current?.id) { _, id in
+        .onChange(of: current?.id) { old, id in
             cancelPrompt()
-            if let id, let r = core.queue.first(where: { $0.id == id }) { approve(r, minutes: nil) }
+            shownAt = Date()
+            // Arm Touch ID by itself only when the island was empty. After a queue advance the
+            // next request waits for a click, so two touches can't release two things (#14).
+            if old == nil, let id, let r = core.queue.first(where: { $0.id == id }) { approve(r, minutes: nil) }
         }
     }
 
     func cancelPrompt() {
-        prompt?.ctx.invalidate()
+        prompt?.invalidate()
         prompt = nil
         confirming = false
         granted = nil
@@ -420,8 +510,6 @@ struct IslandView: View {
 
     @ViewBuilder var content: some View {
         switch mode {
-        case .hidden:
-            EmptyView()
         case .compact:
             compact.frame(height: notch.height)
         case .expanded:
@@ -456,6 +544,7 @@ struct IslandView: View {
         case .expired: return "expired"
         case .notFound: return "notfound"
         case .locked: return "lockedout"
+        case .cancelled: return "cancelled"
         case nil: return core.unlocking ? "unlocking" : "state"
         }
     }
@@ -478,6 +567,7 @@ struct IslandView: View {
             case .expired: Label("Timed out", systemImage: "xmark").foregroundStyle(.red)
             case .notFound: Text("No match").foregroundStyle(.orange)
             case .locked: Text("Locked")
+            case .cancelled: Label("Cancelled", systemImage: "xmark").foregroundStyle(.secondary)
             case nil:
                 if core.unlocking {
                     Image(systemName: "touchid").font(.system(size: 13, weight: .semibold))
@@ -486,7 +576,7 @@ struct IslandView: View {
                     Image(systemName: lockSymbol)
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(stateColor)
-                        .contentTransition(.symbolEffect(.replace.magic(fallback: .downUp.byLayer)))
+                        .modifier(SymbolSwap())
                         .animation(springSwap, value: lockSymbol)
                 }
             }
@@ -507,11 +597,11 @@ struct IslandView: View {
                     }
                     .frame(width: 36, height: 36)
                 } else {
-                    Favicon(domain: r.domain)
+                    Monogram(text: r.title)
                 }
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
-                        Text(r.domain).font(.system(size: 15, weight: .semibold)).lineLimit(1)
+                        Text(r.title).font(.system(size: 15, weight: .semibold)).lineLimit(1)
                         if core.queue.count > 1 {
                             Text("+\(core.queue.count - 1)")
                                 .font(.system(size: 11, weight: .bold))
@@ -521,7 +611,7 @@ struct IslandView: View {
                                 .transition(.blurSwap())
                         }
                     }
-                    Text(detailLine(r))
+                    Text(r.ssh == nil ? "\(r.detail)  ·  → \(r.device)" : r.detail)
                         .font(.system(size: 12))
                         .foregroundStyle(.white.opacity(0.6))
                         .lineLimit(1)
@@ -573,7 +663,7 @@ struct IslandView: View {
                     HStack(spacing: 6) {
                         Image(systemName: lockSymbol).font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(stateColor)
-                            .contentTransition(.symbolEffect(.replace.magic(fallback: .downUp.byLayer)))
+                            .modifier(SymbolSwap())
                         Text(stateLabel).font(.system(size: 14, weight: .semibold))
                             .contentTransition(.interpolate)
                     }
@@ -581,6 +671,20 @@ struct IslandView: View {
                         .contentTransition(.interpolate)
                 }
                 Spacer()
+            }
+            if let token = core.token {
+                HStack {
+                    Text("New agent token").font(.system(size: 12)).foregroundStyle(.white.opacity(0.6))
+                    Spacer()
+                    Button("Copy") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(token, forType: .string)
+                        core.token = nil
+                    }
+                    .buttonStyle(Pill(.quiet))
+                }
+            } else if case .offline = core.state, let last = core.log.last {
+                Text(last).font(.system(size: 11)).foregroundStyle(.orange.opacity(0.8)).lineLimit(2)
             }
             HStack {
                 Spacer()
@@ -608,17 +712,26 @@ struct IslandView: View {
 
     func approve(_ r: CredRequest, minutes m: Int?) {
         guard !confirming else { return }
+        // A click right after the queue advanced belonged to the previous request (#14).
+        guard Date().timeIntervalSince(shownAt) > 0.6 || prompt == nil && core.queue.count == 1 else { return }
         confirming = true
         let what: String
         if let s = r.ssh {
-            let target = s.purpose == "git signing" ? "sign a git commit" : "use \(s.key) for \(r.domain)"
+            let target: String
+            switch s.purpose {
+            case "login": target = "log in to \(r.title) with \(s.key)"
+            case "git signing": target = "sign a git commit with \(s.key)"
+            default: target = "sign \(s.purpose) with \(s.key)"
+            }
             what = m.map { "let \(s.app) \(target) for \($0) minutes" } ?? "let \(s.app) \(target)"
         } else {
-            what = m.map { "allow \(r.domain) for \(r.device) for \($0) minutes" } ?? "release \(r.domain) to \(r.device)"
+            what = m.map { "allow \(r.title) for \(r.device) for \($0) minutes" } ?? "release \(r.title) to \(r.device)"
         }
-        let ctx = confirmPresence(what) { ok in
-            // Ignore a stale answer: the request was decided or replaced meanwhile.
-            guard prompt?.id == r.id else { return }
+        let ctx = LAContext()
+        prompt = ctx
+        confirmPresence(ctx, what) { ok in
+            // Ignore a stale answer: this exact prompt was cancelled or replaced meanwhile (#7).
+            guard prompt === ctx else { return }
             prompt = nil
             confirming = false
             guard ok, core.queue.contains(where: { $0.id == r.id }) else { return }
@@ -635,15 +748,6 @@ struct IslandView: View {
                 core.decide(r, "approve")
             }
         }
-        prompt = (r.id, ctx)
-    }
-
-    func detailLine(_ r: CredRequest) -> String {
-        if let s = r.ssh { return "\(s.key)  ·  \(s.purpose)  ·  \(s.app)" }
-        var parts = [r.username ?? "no username"]
-        if r.hasTotp { parts.append("+ 2FA") }
-        parts.append("→ \(r.device)")
-        return parts.joined(separator: "  ")
     }
 
     func short(_ d: String) -> String { d.count > 18 ? String(d.prefix(17)) + "…" : d }
@@ -661,7 +765,7 @@ struct IslandView: View {
         case .unlocked: return .green
         case .locked: return .red
         case .offline: return .orange
-        case .starting: return .white.opacity(0.7)
+        case .starting, .connecting: return .white.opacity(0.7)
         }
     }
 
@@ -670,6 +774,7 @@ struct IslandView: View {
         case .unlocked: return "Unlocked"
         case .locked: return "Locked"
         case .starting: return "Starting"
+        case .connecting: return "Connecting"
         case .offline: return "Offline"
         }
     }
@@ -678,7 +783,7 @@ struct IslandView: View {
         switch core.state {
         case .unlocked: return "Vault unlocked · requests need your approval"
         case .locked: return "Vault locked · agent requests are denied"
-        case .starting: return "Connecting to relay…"
+        case .starting, .connecting: return "Connecting to relay…"
         case .offline(let why): return why
         }
     }
@@ -707,20 +812,28 @@ struct Mark: View {
     }
 }
 
-struct Favicon: View {
-    let domain: String
+/// First letter of the item name. No network fetch: a remote icon service would learn
+/// which site's secret you're approving, and when (#10).
+struct Monogram: View {
+    let text: String
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 9, style: .continuous).fill(.white.opacity(0.12))
-            Text(domain.first.map { String($0).uppercased() } ?? "?")
+            Text(text.first.map { String($0).uppercased() } ?? "?")
                 .font(.system(size: 17, weight: .bold, design: .rounded))
         }
         .frame(width: 36, height: 36)
-        .overlay(
-            AsyncImage(url: URL(string: "https://icons.duckduckgo.com/ip3/\(domain).ico")) { img in
-                img.resizable().interpolation(.high).scaledToFit().padding(7)
-            } placeholder: { Color.clear }
-        )
+    }
+}
+
+/// Lock ↔ unlock morph. `.replace.magic` exists from macOS 15; older systems get a plain replace (#11).
+struct SymbolSwap: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 15, *) {
+            content.contentTransition(.symbolEffect(.replace.magic(fallback: .downUp.byLayer)))
+        } else {
+            content.contentTransition(.symbolEffect(.replace))
+        }
     }
 }
 
@@ -839,6 +952,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let layout = Layout()
     var panel: IslandPanel!
     var sigterm: DispatchSourceSignal?
+    var cancellables = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ n: Notification) {
         let frameW: CGFloat = 640, frameH: CGFloat = 260
@@ -864,14 +978,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if e.keyCode == 53 { self?.layout.dismissTick += 1 }
             return e
         }
+        // Writing to a dead aac-core pipe must not kill the app (#8).
+        signal(SIGPIPE, SIG_IGN)
+        // Lock when the Mac sleeps or the screen locks, so no Allow window survives you walking away (#6).
+        let lockNow: (Notification) -> Void = { [weak self] _ in self?.core.lock() }
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main, using: lockNow)
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main, using: lockNow)
+        DistributedNotificationCenter.default().addObserver(forName: .init("com.apple.screenIsLocked"), object: nil, queue: .main, using: lockNow)
         signal(SIGTERM, SIG_IGN)
         sigterm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
         sigterm?.setEventHandler { NSApp.terminate(nil) }
         sigterm?.resume()
         core.start()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            if self?.core.state == .locked { self?.core.unlock() }
-        }
+        // Ask for Touch ID once, the first time the listener is ready and locked (not on a timer).
+        core.$state
+            .first { $0 == .locked }
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.core.unlock() }
+            .store(in: &cancellables)
     }
 
     func place(w: CGFloat, h: CGFloat) {
@@ -881,14 +1005,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// The panel is larger than the island; let clicks outside the island fall
     /// through to whatever is underneath (the menu bar, other windows).
+    /// Driven by mouse-move events instead of a 30 Hz timer, so it costs nothing when idle (#24).
+    var mouseMonitors: [Any] = []
     func trackClickThrough() {
-        Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+        let update: (NSEvent?) -> Void = { [weak self] _ in
             guard let self else { return }
             let f = self.panel.frame, s = self.layout.size
             let island = NSRect(x: f.midX - s.width / 2, y: f.maxY - s.height, width: s.width, height: s.height)
             let over = island.insetBy(dx: -4, dy: -4).contains(NSEvent.mouseLocation)
             if self.panel.ignoresMouseEvents == over { self.panel.ignoresMouseEvents = !over }
         }
+        let kinds: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged]
+        if let g = NSEvent.addGlobalMonitorForEvents(matching: kinds, handler: { update($0) }) { mouseMonitors.append(g) }
+        if let l = NSEvent.addLocalMonitorForEvents(matching: kinds, handler: { update($0); return $0 }) { mouseMonitors.append(l) }
+        // The island also resizes under a still pointer; re-check when it does.
+        layout.onResize = { update(nil) }
+        update(nil)
     }
 
     func applicationWillTerminate(_ n: Notification) { core.stop() }
@@ -897,8 +1029,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 // Renders each state to PNG with fake data: `nodwarden --snapshot <dir>`.
 @MainActor
 func snapshot(to dir: String) {
-    let sample = CredRequest(id: 1, domain: "github.com", username: "octocat", device: "a1b2c3d4e5f6",
-                             hasTotp: true, byId: true, arrived: Date(), timeout: 110)
+    let sample = CredRequest(id: 1, title: "GitHub", detail: "octocat  ·  github.com  ·  + 2FA code",
+                             device: "a1b2c3d4e5f6", arrived: Date(), timeout: 110)
     func shot(_ name: String, _ hover: Bool = false, _ pinned: Bool = false, granted: Int? = nil, waiting: Bool = false, _ setup: (Core) -> Void) {
         let core = Core()
         setup(core)
@@ -919,9 +1051,9 @@ func snapshot(to dir: String) {
     shot("3a-cancelled") { $0.state = .unlocked; $0.queue = [sample] }
     shot("3c-ssh", waiting: true) {
         $0.state = .unlocked
-        $0.queue = [CredRequest(id: 2, domain: "github.com", username: nil, device: "", hasTotp: false, byId: false,
-                                arrived: Date(), timeout: 110,
-                                ssh: SSHInfo(key: "Personal Github Key", purpose: "login", app: "pi"))]
+        $0.queue = [CredRequest(id: 2, title: "git@github.com", detail: "Personal Github Key  ·  login  ·  ssh",
+                                device: "ssh", arrived: Date(), timeout: 110,
+                                ssh: SSHInfo(key: "Personal Github Key", purpose: "login", app: "ssh"))]
     }
     shot("3b-touched", granted: 1, waiting: true) { $0.state = .unlocked; $0.queue = [sample] }
     shot("4-queue") { $0.state = .unlocked; $0.queue = [sample, sample] }

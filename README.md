@@ -15,9 +15,10 @@ is asking, and is released only after you approve it with Touch ID.
 NodWarden is a macOS front end for [Bitwarden Agent Access](https://github.com/bitwarden/agent-access).
 Agents use the standard `aac` client; NodWarden replaces the listener on your Mac.
 
-> [!NOTE]
-> NodWarden builds on Bitwarden Agent Access, which is in **early preview**. Its protocol may change.
-> Always use `aac run`, so the secret goes to the process, never into the model's context.
+> [!WARNING]
+> **Alpha (0.0.1).** NodWarden is very early software, and it builds on Bitwarden Agent Access, which is
+> itself in early preview. Expect breaking changes. Always use `aac run`, so the secret goes to the
+> process, never into the model's context.
 
 <p align="center">
   <picture>
@@ -49,14 +50,31 @@ type into that terminal can approve for you.
 **One secret per request. You see exactly what it is. Only your finger releases it.**
 
 - The agent asks for one item (`aac run --domain github.com …`), never the vault.
-- The notch grows open and shows the site, the username, whether a 2FA code comes with it,
+- The notch grows open and shows the item's own name, the username, whether a current 2FA code comes with it,
   which device is asking, and a countdown.
-- Touch ID starts as soon as the request appears: touch the sensor to allow. The fingerprint fills red
+- Touch ID starts as soon as a request appears on an empty island: touch the sensor to allow. When
+  requests queue up, the next one waits for a click, so one touch can't release two things. The fingerprint fills red
   as it's released. Cancel the prompt and the request stays open; click **Allow** to bring Touch ID
   back. **Allow 10m** auto-approves the same device and item for a window
   you choose (5–60 min). **Deny**, or no answer within 110 s, refuses the request.
 - The secret goes into the environment of the agent's child process only. It never reaches
   stdout, so it stays out of the model's context.
+
+### SSH and git signing too
+
+NodWarden also runs an SSH agent with the SSH keys from your Bitwarden vault. Every login and every
+git commit signature shows in the notch (host, key, purpose, and the app asking) and needs Touch ID,
+like 1Password's SSH agent. Bitwarden's own SSH agent only asks for a click.
+
+```
+# ~/.ssh/config
+Host *
+  IdentityAgent "~/.nodwarden/ssh-agent.sock"
+```
+
+For signed commits, set `gpg.format = ssh` and `gpg.ssh.program = ssh-keygen` in git; signing then
+goes through the same agent. Keys load when the vault unlocks and are wiped from memory when it locks.
+Turn off Bitwarden Desktop's own SSH agent so only one agent holds your keys.
 
 ## How it works
 
@@ -83,12 +101,13 @@ sequenceDiagram
 
     A->>R: request "github.com"
     R->>C: request (Noise-encrypted, PSK-paired device)
-    C->>V: bw get item github.com
-    V-->>C: login item (stays in aac-core)
-    C->>N: site, username, 2FA?, device (no secret)
+    C->>V: bw get item github.com (session via stdin)
+    V-->>C: name, username, URL (password discarded)
+    C->>N: item name, username, 2FA?, device (no secret)
     N->>U: island opens
     U->>N: Allow + Touch ID
     N->>C: approve (private stdin pipe)
+    C->>V: now fetch the secret (and a fresh 2FA code)
     C->>R: the one credential
     R->>A: injected into the child's env
     Note over A: gh auth status runs with GH_TOKEN set<br/>the secret never hits stdout
@@ -134,10 +153,14 @@ flowchart LR
 | Attack | Why it fails |
 |---|---|
 | Agent types `y` into the approval prompt | There is no prompt to type into. The only approval channel is NodWarden's private stdin pipe to `aac-core`. |
-| Script clicks **Allow** (AppleScript, Accessibility) | Every Allow also requires Touch ID. A click alone does nothing. |
-| Agent reads the vault session from `ps` or env | The session goes from Touch ID straight into `aac-core`'s stdin. It never appears in argv or the environment of a visible process. |
+| Script clicks **Allow** or types your password (AppleScript, Accessibility) | Allow needs Touch ID or a paired Apple Watch. The login password is not accepted. |
+| Agent reads the vault session from `ps` while `bw` runs | `bw` gets the session through its stdin, set inside the process. It never appears in any process's argv or environment. |
+| Agent sends many requests to fish out the session | Nothing secret is fetched before approval; only item names and usernames. At most 3 requests per device wait at once. |
+| Agent fakes the host or purpose of an SSH signature | The host comes from a verified `session-bind` (the server's host key must sign the session). A login is only labelled a login if the data is a userauth request for that session. Anything else is shown as "unverified data". |
+| Agent reuses your "Allow 10m" | The window covers one key, one verified host, logins only, and one exact program instance. A different program, host, or purpose asks again. Git signing is never auto-allowed. |
+| A fake `bw` or `node` planted on PATH | Tools are resolved to absolute paths at start. Anything in a directory other users can write is refused. Both binaries run with hardened runtime. |
 | A new device tries to pair | Only your reusable PSK is accepted. Rendezvous pairing is refused. |
-| You walk away | Requests time out and are denied after 110 s. Quitting NodWarden runs `bw lock`. |
+| You walk away | Requests time out after 110 s. Sleep or screen lock locks NodWarden: keys and approval windows are cleared and `bw lock` runs. |
 
 `aac-core` is a headless Agent Access listener built on Bitwarden's `ap-client`, pinned to the
 same commit as `aac` 0.11.0. It uses the same `~/.access-protocol` pairing files as
@@ -184,24 +207,30 @@ Don't use `aac connect --output json` for real secrets: it prints them to stdout
 ### What NodWarden guarantees
 
 - An agent never receives your vault or a vault session, only the one item you approved.
-- No request is released without Touch ID, and nothing but NodWarden can approve one.
-- You see the site, username, 2FA and requesting device before you decide.
-- Secrets go into the agent's child process environment, never to stdout or the model's context.
+- Nothing is released without Touch ID (or a paired Apple Watch), and nothing but NodWarden can approve.
+- You see the item's own name, username and requesting device before you decide. For SSH: the verified
+  host, the purpose, and the program asking.
+- Secrets go into the agent's child process environment, never to NodWarden's stdout or logs.
+- Locking (button, sleep, screen lock, or a locked vault) clears keys and approval windows and runs `bw lock`.
 
 ### What's outside any app's control
 
-NodWarden can only control what goes through NodWarden. One thing doesn't: **Bitwarden Desktop's own
-Touch ID unlock.** Any program running as your macOS user can ask Desktop to unlock the vault
-(that's how the browser extension, `bwbio` and `bw unlock` all work), and the prompt reads the same
-*"unlock your vault"* no matter who asked.
+NodWarden controls what goes through NodWarden. Two things running as **your own macOS user** don't:
 
-This is true on any Mac with Bitwarden Desktop and Touch ID enabled, with or without NodWarden.
-NodWarden doesn't add it and doesn't widen it. Two ways to handle it:
+- **Bitwarden Desktop's own Touch ID unlock.** Any program running as you can ask Desktop to unlock the
+  vault (that's how the browser extension, `bwbio` and `bw unlock` work), and the prompt reads the same
+  *"unlock your vault"* no matter who asked. This is true on any Mac with Bitwarden Desktop and Touch ID,
+  with or without NodWarden.
+- **Your own files.** A program running as you can replace files you own, including the `bw` CLI in your
+  home folder.
 
-- **Best:** run agents as a separate macOS user, or in a VM or container. They can't reach your
-  Desktop app at all, and they still get secrets through NodWarden.
-- **Simple:** only touch Touch ID prompts that NodWarden started. NodWarden always shows its
-  request in the notch first.
+So NodWarden protects you from agents on **other machines** completely, and from local agents as long as
+they don't attack your user account itself. Two ways to close the rest:
+
+- **Best:** run agents as a separate macOS user, or in a VM or container. They can't reach your Desktop app
+  or your files, and they still get secrets through NodWarden.
+- **Simple:** only touch Touch ID prompts that NodWarden started. NodWarden always shows its request in
+  the notch first.
 
 ### Compatibility notes
 
@@ -229,7 +258,8 @@ Both hand out the whole vault. `bw serve` has no approval step. A bare Touch ID 
 approving, and one touch gives a full session. NodWarden releases one item, and you see which one.
 
 **Why Touch ID on Allow?**
-A script can click a button. It can't touch the sensor.
+A script can click a button, or even type your password. It can't touch the sensor. NodWarden accepts only
+Touch ID or a paired Apple Watch, so with the lid closed and no watch, nothing can be approved.
 
 **Why a relay?**
 Agent Access uses one, so agents can run on other machines. It's end-to-end encrypted, so it can't read your secrets,
@@ -239,9 +269,17 @@ but it does see connection metadata.
 It works with both bitwarden.com and Vaultwarden. 1Password isn't supported; its CLI has its own approval prompt.
 
 **Is it secure?**
-For everything that goes through it, yes: agents get one approved item, never the vault, and only Touch ID
-releases it. It can't control Bitwarden Desktop's own Touch ID unlock, which any program running as you
-can trigger. Run agents as a separate macOS user to rule that out. See [Security model](#security-model).
+For everything that goes through it, yes: agents get one approved item, never the vault or its session, and
+only your finger releases it. It can't control what any program running as your own user can already do,
+like triggering Bitwarden Desktop's Touch ID unlock. Run agents as a separate macOS user to rule that out.
+See [Security model](#security-model).
+
+**Does it phone home?**
+No. NodWarden makes no network requests of its own. `aac-core` talks only to the Agent Access relay.
+Item icons are drawn locally from the name's first letter.
+
+**Where are the logs?**
+`~/Library/Logs/NodWarden/aac-core.log`, readable only by you. Secrets are never written there.
 
 ## License
 
