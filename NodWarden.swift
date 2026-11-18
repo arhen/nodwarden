@@ -135,6 +135,10 @@ final class Core: ObservableObject {
     @Published var log: [String] = []
     /// The reusable PSK token, when aac-core mints a new one (#19).
     @Published var token: String?
+    /// Why the relay is not connected, while it isn't. Separate from the vault state: with
+    /// the relay down the keys are still loaded and the SSH agent still signs, so the lock
+    /// state and the Lock button must stay.
+    @Published var relayNote: String?
 
     private var proc: Process?
     private var stdin: FileHandle?
@@ -177,6 +181,7 @@ final class Core: ObservableObject {
                 guard let self else { return }
                 self.stdin = nil
                 self.proc = nil
+                self.relayNote = nil
                 for r in self.queue { self.flash(.cancelled(r.title)) }
                 self.queue.removeAll()
                 if case .offline = self.state {} else {
@@ -229,10 +234,12 @@ final class Core: ObservableObject {
             switch e["state"] as? String {
             case "unlocked": state = .unlocked
             case "locked": state = .locked
-            case "connecting": if state != .unlocked && state != .locked { state = .connecting }
+            case "connecting":
+                relayNote = e["detail"] as? String ?? "connecting to relay"
+                if state != .unlocked && state != .locked { state = .connecting }
             case "listening":
-                // Only a core that reached the relay ends the backoff (#8). Every core says
-                // "locked" as its first line, before it has tried anything.
+                relayNote = nil
+                // Only a core that reached the relay ends the backoff (#8).
                 restartDelay = 1
                 if state == .connecting || state == .starting { state = .locked }
             case "offline": state = .offline(e["detail"] as? String ?? "offline")
@@ -859,8 +866,8 @@ struct IslandView: View {
 
     var stateDetail: String {
         switch core.state {
-        case .unlocked: return "Vault unlocked · requests need your approval"
-        case .locked: return "Vault locked · agent requests are denied"
+        case .unlocked: return "Vault unlocked · \(core.relayNote ?? "requests need your approval")"
+        case .locked: return "Vault locked · \(core.relayNote ?? "agent requests are denied")"
         case .starting, .connecting: return "Connecting to relay…"
         case .offline(let why): return why
         }
@@ -1147,7 +1154,8 @@ func snapshot(to dir: String) {
     shot("6-denied") { $0.state = .unlocked; $0.outcome = .denied("github.com") }
     shot("7-locked-pinned", false, true) { $0.state = .locked }
     shot("8-unlocking") { $0.state = .locked; $0.unlocking = true }
-    shot("9-offline") { $0.state = .offline("relay disconnected") }
+    shot("9-offline") { $0.state = .offline("relay: connection refused") }
+    shot("9b-relay-down", false, true) { $0.state = .unlocked; $0.relayNote = "relay disconnected, reconnecting" }
 }
 
 @main

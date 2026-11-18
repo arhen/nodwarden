@@ -8,6 +8,8 @@
 //!          {"op":"decide","id":N,"decision":"approve"|"deny"|"approve_for","minutes":M}
 //!          {"op":"lock"}
 //!   stdout {"ev":"status","state":"locked"|"unlocked"|"connecting"|"listening"|"offline","detail":..}
+//!            locked/unlocked: the vault. connecting/listening: the relay, which does not change
+//!            the vault state. offline: fatal, the process exits.
 //!          {"ev":"token","token":..}                      reusable PSK, once, when minted
 //!          {"ev":"request","id":N,"name":..,"domain":..,"username":..,"device":..,"kind":..,"has_totp":..}
 //!          {"ev":"ssh_request","id":N,...}                see ssh_agent::ask_json
@@ -549,7 +551,8 @@ async fn run() -> Result<(), String> {
         std::process::exit(0);
     });
 
-    emit(json!({"ev":"status","state":"locked"}));
+    // "locked" is said once the relay is reached ("listening"): the UI asks for the unlock
+    // Touch ID on the first "locked", and that is wasted on a core about to exit offline.
     emit(json!({"ev":"status","state":"connecting"}));
 
     let identity = FileIdentityStorage::load_or_generate("user_client").map_err(|e| e.to_string())?;
@@ -579,6 +582,7 @@ async fn run() -> Result<(), String> {
         tighten_access_protocol_perms();
     }
     emit(json!({"ev":"status","state":"listening"}));
+    emit(json!({"ev":"status","state":"locked"}));
 
     let (done_tx, mut done_rx) = mpsc::channel::<Done>(32);
     let (ssh_tx, mut ssh_rx) = mpsc::channel::<ssh_agent::SignAsk>(16);
@@ -612,12 +616,15 @@ async fn run() -> Result<(), String> {
             Some(ask) = ssh_rx.recv() => core.on_ssh_ask(ask),
 
             Some(n) = notes.recv() => match n {
-                UserClientNotification::Reconnecting { attempt } =>
-                    emit(json!({"ev":"status","state":"connecting","detail":format!("reconnecting ({attempt})")})),
-                UserClientNotification::Reconnected {} =>
-                    emit(json!({"ev":"status","state": if core.session.is_some() {"unlocked"} else {"locked"}})),
+                // The relay going away does not change the vault state: keys stay loaded and the
+                // SSH agent keeps answering, so the UI must keep showing the lock state (and Lock).
+                // ap-client reconnects by itself, for as long as it takes.
                 UserClientNotification::ClientDisconnected {} =>
-                    emit(json!({"ev":"status","state":"offline","detail":"relay disconnected"})),
+                    emit(json!({"ev":"status","state":"connecting","detail":"relay disconnected, reconnecting"})),
+                UserClientNotification::Reconnecting { attempt } =>
+                    emit(json!({"ev":"status","state":"connecting","detail":format!("relay unreachable, retry {attempt}")})),
+                UserClientNotification::Reconnected {} =>
+                    emit(json!({"ev":"status","state":"listening"})),
                 UserClientNotification::Error { message, .. } =>
                     emit(json!({"ev":"log","msg":message})),
                 _ => {}
