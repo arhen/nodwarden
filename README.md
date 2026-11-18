@@ -181,6 +181,37 @@ Don't use `aac connect --output json` for real secrets: it prints them to stdout
   Upgrade the server, or pin `bw` 2026.8.0.
 - Agent Access is an early preview. Its protocol may change.
 
+## FAQ
+
+**Why `bwbio`?**
+The `bw` CLI can't use Touch ID on its own. `bwbio` gets a session from Bitwarden Desktop's Touch ID unlock.
+Without it, you type your master password once per login. It can go once official `bw` Touch ID works with your server.
+
+**Why not just use `aac listen` and put a GUI on top?**
+`aac listen` is a terminal program: you approve by pressing `y`. Any process running as you, including the agent,
+can send that key. NodWarden runs its own listener on Bitwarden's `ap-client`, so only NodWarden can answer.
+Agents still use the standard `aac run`.
+
+**Why not let Bitwarden Desktop handle requests?**
+It doesn't support Agent Access. NodWarden only uses it for Touch ID unlock.
+
+**Why not `bw serve`, or Touch ID before every `bw` command?**
+Both hand out the whole vault. `bw serve` has no approval step. A bare Touch ID prompt doesn't show what you're
+approving, and one touch gives a full session. NodWarden releases one item, and you see which one.
+
+**Why Touch ID on Allow?**
+A script can click a button. It can't touch the sensor.
+
+**Why a relay?**
+Agent Access uses one, so agents can run on other machines. It's end-to-end encrypted, so it can't read your secrets,
+but it does see connection metadata.
+
+**Does it work with Vaultwarden? 1Password?**
+It works with both bitwarden.com and Vaultwarden. 1Password isn't supported; its CLI has its own approval prompt.
+
+**Is it fully secure?**
+No. See [Known limits](#known-limits).
+
 ## License
 
 Apache-2.0. `core/src/storage/*` is copied unmodified from
