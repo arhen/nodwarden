@@ -162,7 +162,7 @@ flowchart LR
 | Agent reuses your "Allow 10m" | A window covers one key, the shell or agent session it was opened from, and one purpose: logins to one verified host, or git commit signing (the `git` namespace only). Another terminal tab, another agent, another host, another purpose or a forwarded request asks again. A program you start from that same shell or agent while the window is open can use it. |
 | A fake `bw` or `node` planted on PATH | Tools are resolved to absolute paths at start. A path that another user could change is refused (administrators excepted: they can already use `sudo`). Both binaries run with hardened runtime. |
 | A new device tries to pair | Only your reusable PSK is accepted. Rendezvous pairing is refused. |
-| You walk away | Requests time out after 110 s. Sleep or screen lock locks NodWarden: keys and approval windows are cleared and `bw lock` runs. |
+| You walk away | Requests time out after 110 s. Sleep, screen lock, switching to another user, or 15 minutes without keyboard or mouse input locks NodWarden: keys and approval windows are cleared and `bw lock` runs. An "Allow 60m" window ends at the idle lock. |
 
 `aac-core` is a headless Agent Access listener built on Bitwarden's `ap-client`, pinned to the
 same commit as `aac` 0.11.0. It uses the same `~/.access-protocol` pairing files as
@@ -207,6 +207,16 @@ aac run --id <vault-item-uuid> --env DB_PASS=password -- ./deploy.sh
 When more than one vault item matches a domain, the request is denied. Use `--id`.
 Don't use `aac connect --output json` for real secrets: it prints them to stdout.
 
+**Pairing token.** On first run, NodWarden shows a reusable token in the status panel (click the
+island); Copy keeps it on this Mac only. **New agent token** makes another one. Earlier tokens keep
+working. The relay must be reachable to make a token.
+
+**Without the relay.** The SSH agent and unlock work offline; only agent credential requests need the
+relay.
+
+**Idle lock.** NodWarden locks after 15 minutes without keyboard or mouse input. Change it with
+`defaults write io.github.nodwarden idleLockMinutes -int 30`, or `0` to turn it off.
+
 ## Security model
 
 ### What NodWarden guarantees
@@ -217,7 +227,9 @@ Don't use `aac connect --output json` for real secrets: it prints them to stdout
 - You see the item's own name, username and requesting device before you decide. For SSH: the verified
   host, the purpose, and the program asking.
 - Secrets go into the agent's child process environment, never to NodWarden's stdout or logs.
-- Locking (button, sleep, screen lock, or a locked vault) clears keys and approval windows and runs `bw lock`.
+- Locking (button, sleep, screen lock, user switch, idle, or a locked vault) clears keys and approval
+  windows and runs `bw lock`. If the app crashes or is force-quit, the core still runs `bw lock` before
+  it exits.
 
 ### What's outside any app's control
 

@@ -99,8 +99,15 @@ impl Bw {
         serde_json::from_slice::<S>(&out.stdout).ok().map(|s| s.status)
     }
 
-    pub async fn lock(&self) {
-        let _ = self.run(None, &["lock"]).await;
+    /// Locks bw so a session copied from anywhere stops working. Tries twice; the result is
+    /// returned so a failure can be reported instead of silently claiming "locked" (#15).
+    pub async fn lock(&self) -> bool {
+        for _ in 0..2 {
+            if matches!(self.run(None, &["lock"]).await, Ok(o) if o.ok) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -143,6 +150,20 @@ pub struct Output {
     pub ok: bool,
     pub stdout: Zeroizing<Vec<u8>>,
     pub stderr: String,
+}
+
+/// The one resolver for the tools both sides run (#23). `aac-core --tools` prints this as JSON
+/// and the app uses it, so the trust check lives in one place. Each entry: where it was found on
+/// PATH and the trusted real path, or why it was refused.
+pub fn tools_report() -> serde_json::Value {
+    let one = |name: &str| match which(name) {
+        None => serde_json::json!({"error": format!("{name} not found on PATH")}),
+        Some(found) => match resolve_trusted(&found) {
+            Ok(real) => serde_json::json!({"found": found, "real": real}),
+            Err(e) => serde_json::json!({"found": found, "error": e}),
+        },
+    };
+    serde_json::json!({"node": one("node"), "bw": one("bw"), "bwbio": one("bwbio")})
 }
 
 fn which(name: &str) -> Option<PathBuf> {

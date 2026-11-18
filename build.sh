@@ -10,7 +10,7 @@ mkdir -p "$here/build"
 # Remove the old binary first so a failed compile can't install a stale one (#12).
 rm -f "$here/build/nodwarden"
 swiftc -O -swift-version 5 -parse-as-library -target arm64-apple-macos14.0 \
-  -o "$here/build/nodwarden" "$here/NodWarden.swift"
+  -o "$here/build/nodwarden" "$here"/Sources/*.swift
 
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"

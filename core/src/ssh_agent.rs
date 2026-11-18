@@ -72,8 +72,11 @@ pub struct Peer {
 }
 
 impl Peer {
+    /// The executable's file name, if it is short visible ASCII; else "unknown program". The
+    /// path comes from the kernel, but whoever made the file chose its name (#7).
     pub fn name(&self) -> String {
-        self.path.rsplit('/').next().unwrap_or(&self.path).to_string()
+        let n = self.path.rsplit('/').next().unwrap_or(&self.path);
+        if printable(n, 32) { n.to_string() } else { "unknown program".into() }
     }
 }
 
@@ -81,8 +84,11 @@ impl Peer {
 pub struct SignAsk {
     pub key_name: String,
     pub fingerprint: String,
-    /// Verified host for a login; None for anything else.
+    /// Verified host for a login (a label, with the port); None for anything else.
     pub host: Option<String>,
+    /// SHA-256 fingerprint of that host's key. The Allow window is keyed on this, not on
+    /// the label, so a different server with the same name never matches (#2).
+    pub host_key: Option<String>,
     pub user: Option<String>,
     /// "login", "<namespace> signing" (e.g. "git signing"), or "unverified data".
     pub purpose: String,
@@ -99,35 +105,72 @@ pub struct SignAsk {
 
 impl SignAsk {
     fn allow_key(&self) -> Option<AllowKey> {
-        allow_key(&self.fingerprint, &self.host, &self.purpose, &self.peer, &self.via)
+        allow_key(&self.fingerprint, &self.host_key, &self.user, &self.purpose, &self.peer, &self.via)
+            .map(|mut k| {
+                k.host_label = Label(self.host.clone().unwrap_or_default());
+                k
+            })
     }
 }
 
-/// What an Allow window covers: exactly what the user saw (#3).
+/// A display string that never takes part in equality or hashing.
+#[derive(Clone, Debug, Default)]
+struct Label(String);
+impl PartialEq for Label {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for Label {}
+impl std::hash::Hash for Label {
+    fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
+}
+impl std::fmt::Display for Label {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// What an Allow window covers: one key, one purpose, one program instance, and for a login
+/// one host key and one user (#2, #3, #4).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct AllowKey {
     fingerprint: String,
-    host: Option<String>,
+    /// The server's host key fingerprint, not its name (#2); None for git signing.
+    host_key: Option<String>,
+    /// Shown in the status panel only. Not part of what the window matches on.
+    host_label: Label,
+    /// The login user: a window for deploy@server never covers root@server (#4).
+    user: Option<String>,
     purpose: String,
     peer: Peer,
 }
 
 /// What an Allow window may cover, for an identified local program only (#3):
-/// - a verified login: that key, that host;
+/// - a verified login: that key, that host key, that user;
 /// - git commit signing: that key, the `git` SSHSIG namespace only. There is no host, so the
 ///   window means "this session may sign commits with this key". Other namespaces never match.
 ///
 /// A forwarded request is made by whoever controls the remote host, so it always asks.
-fn allow_key(fingerprint: &str, host: &Option<String>, purpose: &str, peer: &Option<Peer>, via: &[String]) -> Option<AllowKey> {
+fn allow_key(
+    fingerprint: &str,
+    host_key: &Option<String>,
+    user: &Option<String>,
+    purpose: &str,
+    peer: &Option<Peer>,
+    via: &[String],
+) -> Option<AllowKey> {
     let peer = peer.as_ref()?;
     let rememberable = match purpose {
-        "login" => host.is_some(),
-        "git signing" => host.is_none(),
+        "login" => host_key.is_some() && user.is_some(),
+        "git signing" => host_key.is_none(),
         _ => false,
     };
     (rememberable && via.is_empty()).then(|| AllowKey {
         fingerprint: fingerprint.to_owned(),
-        host: host.clone(),
+        host_key: host_key.clone(),
+        host_label: Label::default(),
+        user: user.clone(),
         purpose: purpose.to_owned(),
         peer: peer.clone(),
     })
@@ -143,6 +186,31 @@ pub struct State {
 impl State {
     pub fn clear(&mut self) {
         self.keys.clear();
+        self.allowed.clear();
+    }
+
+    /// Open Allow windows, for the status panel (#5): what each covers and seconds left.
+    pub fn windows(&mut self) -> Vec<(String, u64)> {
+        let now = Instant::now();
+        self.allowed.retain(|_, t| *t > now);
+        let mut v: Vec<(String, u64)> = self
+            .allowed
+            .iter()
+            .map(|(k, t)| {
+                let what = match (&k.user, k.purpose.as_str()) {
+                    (Some(u), "login") => format!("login {u}@{} · {}", k.host_label, k.peer.name()),
+                    (_, "git signing") => format!("git signing · {}", k.peer.name()),
+                    _ => k.purpose.clone(),
+                };
+                (what, t.saturating_duration_since(now).as_secs())
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Ends every open Allow window (#5).
+    pub fn end_windows(&mut self) {
         self.allowed.clear();
     }
 
@@ -230,6 +298,10 @@ async fn serve_at(path: PathBuf, state: Shared, asks: mpsc::Sender<SignAsk>) -> 
     let listener = UnixListener::bind(&path).map_err(|e| format!("ssh agent socket: {e}"))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| format!("chmod socket: {e}"))?;
     let uid = unsafe { libc::getuid() };
+    raise_fd_limit();
+    // At most this many agent connections at once, so idle ones can't use up the descriptors
+    // that `bw` (and `bw lock`) need (#22).
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             // Out of file descriptors, most likely. Wait for some to close; don't spin.
@@ -239,19 +311,39 @@ async fn serve_at(path: PathBuf, state: Shared, asks: mpsc::Sender<SignAsk>) -> 
         if peer_uid(&stream) != Some(uid) {
             continue;
         }
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            continue; // full: drop the connection (the client sees EOF and fails)
+        };
         let (state, asks) = (state.clone(), asks.clone());
         tokio::spawn(async move {
             let _ = handle(stream, state, asks).await;
+            drop(permit);
         });
     }
 }
 
 /// Hops an agent connection may be forwarded through before binds are refused.
 const MAX_HOPS: usize = 8;
+/// Agent connections served at once (#22).
+const MAX_CONNECTIONS: usize = 64;
+/// A message that has started must finish within this (#22). Between messages a connection
+/// may stay idle for as long as the client likes (ssh keeps one open per session).
+const MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Raises the soft descriptor limit toward the hard one, so a burst of connections and the
+/// `bw` processes fit (the default soft limit on macOS is 256).
+fn raise_fd_limit() {
+    let mut r = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) } == 0 {
+        r.rlim_cur = r.rlim_max.min(4096);
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) };
+    }
+}
 
 /// One verified `session-bind@openssh.com`.
 struct SessionBind {
     host: String,
+    host_fp: String,
     hostkey: Vec<u8>,
     session_id: Vec<u8>,
     forwarding: bool,
@@ -260,8 +352,9 @@ struct SessionBind {
 /// What the verified binds on one connection say about it.
 #[derive(Default)]
 struct Bind {
-    /// The host a login on this connection is for, and its key blob.
+    /// The host a login on this connection is for (label), its key fingerprint and key blob.
     host: Option<String>,
+    host_fp: Option<String>,
     hostkey: Vec<u8>,
     session_id: Vec<u8>,
     /// Hosts this connection was forwarded through, nearest first.
@@ -282,6 +375,7 @@ impl Bind {
             self.via.push(b.host);
         } else {
             self.host = Some(b.host);
+            self.host_fp = Some(b.host_fp);
             self.hostkey = b.hostkey;
             self.session_id = b.session_id;
         }
@@ -290,7 +384,9 @@ impl Bind {
 }
 
 async fn handle(mut s: UnixStream, state: Shared, asks: mpsc::Sender<SignAsk>) -> std::io::Result<()> {
-    let pid = peer_pid(&s);
+    // Pin the peer to one process instance at connect time (#3). A pid alone can be reused by
+    // another process later; pid + start time can't.
+    let pid = peer_pid(&s).and_then(|p| process_start(p).map(|t| (p, t)));
     let mut bind = Bind::default();
     loop {
         let mut len = [0u8; 4];
@@ -302,7 +398,10 @@ async fn handle(mut s: UnixStream, state: Shared, asks: mpsc::Sender<SignAsk>) -
             return Ok(());
         }
         let mut msg = vec![0u8; n];
-        s.read_exact(&mut msg).await?;
+        match tokio::time::timeout(MESSAGE_TIMEOUT, s.read_exact(&mut msg)).await {
+            Ok(r) => { r?; }
+            Err(_) => return Ok(()), // started a message and stalled: drop it
+        }
         let reply = match msg[0] {
             SSH2_AGENTC_REQUEST_IDENTITIES => identities(&state).await,
             SSH2_AGENTC_SIGN_REQUEST => sign(&mut s, &msg[1..], &state, &asks, pid, &bind).await,
@@ -407,7 +506,7 @@ async fn sign(
     body: &[u8],
     state: &Shared,
     asks: &mpsc::Sender<SignAsk>,
-    pid: Option<i32>,
+    pid: Option<(i32, u64)>,
     bind: &Bind,
 ) -> Vec<u8> {
     let mut rd = Reader(body);
@@ -422,12 +521,19 @@ async fn sign(
         }
     };
     let (purpose, host, user) = classify(&data, bind, &blob);
+    // If the pid now belongs to a different process than the one that connected, the peer is
+    // unknown: no anchor, no Allow window, shown as "unknown program" (#3).
     let (peer, chain) = match pid {
-        Some(p) => tokio::task::spawn_blocking(move || (anchor_of(p), chain_of(p))).await.unwrap_or((None, Vec::new())),
+        Some((p, start)) => tokio::task::spawn_blocking(move || {
+            if process_start(p) == Some(start) { (anchor_of(p), chain_of(p)) } else { (None, Vec::new()) }
+        })
+        .await
+        .unwrap_or((None, Vec::new())),
         None => (None, Vec::new()),
     };
 
-    let allow_key = allow_key(&fingerprint, &host, &purpose, &peer, &bind.via);
+    let host_key = if purpose == "login" { bind.host_fp.clone() } else { None };
+    let allow_key = allow_key(&fingerprint, &host_key, &user, &purpose, &peer, &bind.via);
     let auto = match &allow_key {
         Some(k) => {
             let mut st = state.lock().await;
@@ -439,12 +545,12 @@ async fn sign(
     };
 
     // A request that an Allow window covers never waits for the user, so it takes no place.
-    let wait_key = pid.unwrap_or(0);
+    let wait_key = pid.map_or(0, |(p, _)| p);
     if !auto && !state.lock().await.start_waiting(wait_key) {
         return vec![SSH_AGENT_FAILURE];
     }
     let (tx, rx) = oneshot::channel();
-    let ask = SignAsk { key_name, fingerprint, host, user, purpose, peer, chain, via: bind.via.clone(), auto, reply: tx };
+    let ask = SignAsk { key_name, fingerprint, host, host_key, user, purpose, peer, chain, via: bind.via.clone(), auto, reply: tx };
     let approved = if asks.send(ask).await.is_err() {
         false
     } else {
@@ -563,12 +669,13 @@ fn session_bind(body: &[u8]) -> Option<SessionBind> {
         key.verify(&session_id, &sig).ok()?;
     }
     let fp = key.fingerprint(HashAlg::Sha256).to_string();
-    Some(SessionBind { host: known_host_for(&fp).unwrap_or(fp), hostkey, session_id, forwarding })
+    Some(SessionBind { host: known_host_for(&fp).unwrap_or_else(|| fp.clone()), host_fp: fp, hostkey, session_id, forwarding })
 }
 
 /// Maps a verified host key fingerprint to a hostname via ~/.ssh/known_hosts (unhashed entries).
 fn known_host_for(fp: &str) -> Option<String> {
     let text = std::fs::read_to_string(dirs::home_dir()?.join(".ssh/known_hosts")).ok()?;
+    let mut names: Vec<String> = Vec::new();
     for line in text.lines() {
         let mut parts = line.split_whitespace();
         let (Some(hosts), Some(kt), Some(kb)) = (parts.next(), parts.next(), parts.next()) else { continue };
@@ -578,11 +685,22 @@ fn known_host_for(fp: &str) -> Option<String> {
         }
         let Ok(pk) = ssh_key::PublicKey::from_openssh(&format!("{kt} {kb}")) else { continue };
         if pk.fingerprint(HashAlg::Sha256).to_string() == fp {
-            let first = hosts.split(',').next()?;
-            return Some(first.trim_start_matches('[').split(']').next().unwrap_or(first).to_string());
+            names.extend(hosts.split(',').map(host_label));
         }
     }
-    None
+    names.dedup();
+    let first = names.first()?.clone();
+    // Several names for one key (cloned machines, aliases): say so instead of guessing (#2).
+    Some(if names.len() > 1 { format!("{first} +{}", names.len() - 1) } else { first })
+}
+
+/// `[host]:port` -> `host:port`; a bare host stays as is. The port is kept (#2): `localhost:2222`
+/// and `localhost:22` are different servers.
+fn host_label(entry: &str) -> String {
+    match entry.strip_prefix('[').and_then(|r| r.split_once("]:")) {
+        Some((h, port)) => format!("{h}:{port}"),
+        None => entry.trim_start_matches('[').trim_end_matches(']').to_string(),
+    }
 }
 
 fn peer_pid(s: &UnixStream) -> Option<i32> {
@@ -614,8 +732,13 @@ fn exe_path(pid: i32) -> Option<String> {
 }
 
 fn peer_of(pid: i32) -> Option<Peer> {
+    Some(Peer { pid, start: process_start(pid)?, path: exe_path(pid)? })
+}
+
+/// Start time of a process in microseconds; with the pid it names one process instance.
+fn process_start(pid: i32) -> Option<u64> {
     let info = bsdinfo(pid)?;
-    Some(Peer { pid, start: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec, path: exe_path(pid)? })
+    Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
 }
 
 fn exe_name(path: &str) -> &str {
@@ -781,7 +904,13 @@ mod tests {
     fn login_needs_bound_session_id() {
         const HOSTBOUND: &[u8] = b"publickey-hostbound-v00@openssh.com";
         let (sid, key, hostkey) = (b"session-123".to_vec(), b"my-key-blob".to_vec(), b"host-key-blob".to_vec());
-        let bound = Bind { host: Some("github.com".into()), hostkey: hostkey.clone(), session_id: sid.clone(), via: Vec::new() };
+        let bound = Bind {
+            host: Some("github.com".into()),
+            host_fp: Some("SHA256:gh".into()),
+            hostkey: hostkey.clone(),
+            session_id: sid.clone(),
+            via: Vec::new(),
+        };
         let login = ("login".to_string(), Some("github.com".to_string()), Some("git".to_string()));
         let plain = userauth(&sid, b"git", b"publickey", &key, None);
         assert_eq!(classify(&plain, &bound, &key), login);
@@ -861,19 +990,60 @@ mod tests {
         assert!(!bind.add(session_bind(&bind_body(&jump, b"sid-3", b"sid-3", true)).unwrap()));
 
         let peer = Some(Peer { pid: 1, start: 1, path: "/usr/bin/ssh".into() });
-        let host = Some("github.com".to_string());
-        assert!(allow_key("SHA256:k", &host, "login", &peer, &[]).is_some());
-        assert!(allow_key("SHA256:k", &host, "login", &peer, &bind.via).is_none(), "forwarded login was remembered");
+        let (hk, user) = (Some("SHA256:host".to_string()), Some("git".to_string()));
+        assert!(allow_key("SHA256:k", &hk, &user, "login", &peer, &[]).is_some());
+        assert!(allow_key("SHA256:k", &hk, &user, "login", &peer, &bind.via).is_none(), "forwarded login was remembered");
+        // A login with no verified host key or no user is never remembered.
+        assert!(allow_key("SHA256:k", &None, &user, "login", &peer, &[]).is_none());
+        assert!(allow_key("SHA256:k", &hk, &None, "login", &peer, &[]).is_none());
         // Git signing: rememberable for a local identified program, never when forwarded,
         // and only the exact `git` namespace (other SSHSIG namespaces always ask).
-        assert!(allow_key("SHA256:k", &None, "git signing", &peer, &[]).is_some());
-        assert!(allow_key("SHA256:k", &None, "git signing", &peer, &bind.via).is_none());
-        assert!(allow_key("SHA256:k", &None, "file signing", &peer, &[]).is_none());
-        assert!(allow_key("SHA256:k", &None, "unverified data", &peer, &[]).is_none());
-        assert!(allow_key("SHA256:k", &None, "git signing", &None, &[]).is_none());
+        assert!(allow_key("SHA256:k", &None, &None, "git signing", &peer, &[]).is_some());
+        assert!(allow_key("SHA256:k", &None, &None, "git signing", &peer, &bind.via).is_none());
+        assert!(allow_key("SHA256:k", &None, &None, "file signing", &peer, &[]).is_none());
+        assert!(allow_key("SHA256:k", &None, &None, "unverified data", &peer, &[]).is_none());
+        assert!(allow_key("SHA256:k", &None, &None, "git signing", &None, &[]).is_none());
         // A git window and a login window for the same key never cover each other.
-        assert_ne!(allow_key("SHA256:k", &None, "git signing", &peer, &[]), allow_key("SHA256:k", &host, "login", &peer, &[]));
-        assert!(allow_key("SHA256:k", &host, "login", &None, &[]).is_none());
+        assert_ne!(
+            allow_key("SHA256:k", &None, &None, "git signing", &peer, &[]),
+            allow_key("SHA256:k", &hk, &user, "login", &peer, &[])
+        );
+        assert!(allow_key("SHA256:k", &hk, &user, "login", &None, &[]).is_none());
+    }
+
+    #[test]
+    fn window_is_bound_to_host_key_and_user_not_the_name() {
+        let peer = Some(Peer { pid: 1, start: 1, path: "/bin/zsh".into() });
+        let w = |hk: &str, u: &str| allow_key("SHA256:k", &Some(hk.into()), &Some(u.into()), "login", &peer, &[]);
+        // #2: same name, different host key (another server behind the same name/port) -> no match.
+        assert_ne!(w("SHA256:server-a", "deploy"), w("SHA256:server-b", "deploy"));
+        // #4: same server, different user -> no match.
+        assert_ne!(w("SHA256:server-a", "deploy"), w("SHA256:server-a", "root"));
+        assert_eq!(w("SHA256:server-a", "deploy"), w("SHA256:server-a", "deploy"));
+    }
+
+    #[test]
+    fn host_label_keeps_the_port() {
+        assert_eq!(host_label("[localhost]:2222"), "localhost:2222");
+        assert_eq!(host_label("github.com"), "github.com");
+        assert_eq!(host_label("[::1]:2200"), "::1:2200");
+    }
+
+    #[test]
+    fn peer_name_is_sanitized() {
+        let p = |path: &str| Peer { pid: 1, start: 1, path: path.into() }.name();
+        assert_eq!(p("/usr/bin/ssh"), "ssh");
+        assert_eq!(p("/tmp/please approve this, it is your bank"), "unknown program");
+        assert_eq!(p(&format!("/tmp/{}", "a".repeat(40))), "unknown program");
+    }
+
+    #[test]
+    fn pid_is_pinned_to_start_time() {
+        let me = std::process::id() as i32;
+        let start = process_start(me).expect("own start time");
+        assert_eq!(process_start(me), Some(start), "stable for the same process");
+        // A pid that doesn't exist has no start time, so it can never match a recorded one.
+        assert_eq!(process_start(i32::MAX - 7), None);
     }
 
     #[test]
@@ -986,6 +1156,82 @@ mod tests {
                 .unwrap();
             assert!(verify.status.success(), "{key_type} verify: {}", String::from_utf8_lossy(&verify.stderr));
         }
+    }
+
+    /// The git-signing window end to end, with real `ssh-keygen` (#20): the first signature
+    /// asks and opens a window; the second is covered (no ask, `auto`); after a lock the
+    /// window is gone and the next one asks again.
+    #[tokio::test]
+    async fn git_window_covers_the_next_signature_and_lock_clears_it() {
+        if !std::path::Path::new(SSH_KEYGEN).exists() {
+            eprintln!("no ssh-keygen; skipped");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("nw-gitwin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = dir.join("id");
+        keygen(&["-q", "-t", "ed25519", "-N", "", "-C", "test", "-f", id.to_str().unwrap()]).await;
+        let key = PrivateKey::read_openssh_file(&id).unwrap();
+        let mut blob = Vec::new();
+        key.public_key().key_data().encode(&mut blob).unwrap();
+        let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
+        let keys = || vec![Key { name: "k".into(), key: key.clone(), blob: blob.clone(), fingerprint: fingerprint.clone() }];
+        let state: Shared = Arc::new(Mutex::new(State { keys: keys(), ..Default::default() }));
+
+        // The UI side: approve everything, and open a 10-minute window on the first ask.
+        let asked = Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+        let (tx, mut rx) = mpsc::channel::<SignAsk>(4);
+        {
+            let (state, asked) = (state.clone(), asked.clone());
+            tokio::spawn(async move {
+                while let Some(a) = rx.recv().await {
+                    asked.lock().unwrap().push(a.auto);
+                    if !a.auto {
+                        allow_for(&state, &a, Instant::now() + Duration::from_secs(600)).await;
+                    }
+                    let _ = a.reply.send(true);
+                }
+            });
+        }
+        let sock = dir.join("agent.sock");
+        tokio::spawn(serve_at(sock.clone(), state.clone(), tx));
+        for _ in 0..100 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let sign = |n: u32| {
+            let (sock, dir) = (sock.clone(), dir.clone());
+            async move {
+                let msg = dir.join(format!("m{n}"));
+                std::fs::write(&msg, format!("commit {n}\n")).unwrap();
+                tokio::process::Command::new(SSH_KEYGEN)
+                    .args(["-Y", "sign", "-n", "git", "-f", dir.join("id.pub").to_str().unwrap(), msg.to_str().unwrap()])
+                    .env("SSH_AUTH_SOCK", &sock)
+                    .output()
+                    .await
+                    .unwrap()
+                    .status
+                    .success()
+            }
+        };
+
+        assert!(sign(1).await, "first signature");
+        assert!(sign(2).await, "second signature");
+        // ssh-keygen runs a new process each time, so a window keyed on that process would
+        // never match; the anchor is this test process, which stays the same.
+        assert_eq!(*asked.lock().unwrap(), [false, true], "first asks, second is covered by the window");
+        assert_eq!(state.lock().await.windows().len(), 1, "one open window");
+
+        // Lock: keys and windows cleared. Unlock again (keys back): the next signature asks.
+        state.lock().await.clear();
+        assert!(state.lock().await.windows().is_empty(), "lock clears windows");
+        state.lock().await.keys = keys();
+        assert!(sign(3).await, "third signature");
+        assert_eq!(*asked.lock().unwrap(), [false, true, false], "after a lock the window is gone");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Real `ssh` logging in to a real `sshd` through the agent: the session-bind OpenSSH sends
