@@ -112,11 +112,20 @@ struct AllowKey {
     peer: Peer,
 }
 
-/// Only a login by an identified local program can be covered by an Allow window (#3).
+/// What an Allow window may cover, for an identified local program only (#3):
+/// - a verified login: that key, that host;
+/// - git commit signing: that key, the `git` SSHSIG namespace only. There is no host, so the
+///   window means "this session may sign commits with this key". Other namespaces never match.
+///
 /// A forwarded request is made by whoever controls the remote host, so it always asks.
 fn allow_key(fingerprint: &str, host: &Option<String>, purpose: &str, peer: &Option<Peer>, via: &[String]) -> Option<AllowKey> {
     let peer = peer.as_ref()?;
-    (purpose == "login" && via.is_empty()).then(|| AllowKey {
+    let rememberable = match purpose {
+        "login" => host.is_some(),
+        "git signing" => host.is_none(),
+        _ => false,
+    };
+    (rememberable && via.is_empty()).then(|| AllowKey {
         fingerprint: fingerprint.to_owned(),
         host: host.clone(),
         purpose: purpose.to_owned(),
@@ -855,7 +864,15 @@ mod tests {
         let host = Some("github.com".to_string());
         assert!(allow_key("SHA256:k", &host, "login", &peer, &[]).is_some());
         assert!(allow_key("SHA256:k", &host, "login", &peer, &bind.via).is_none(), "forwarded login was remembered");
-        assert!(allow_key("SHA256:k", &None, "git signing", &peer, &[]).is_none());
+        // Git signing: rememberable for a local identified program, never when forwarded,
+        // and only the exact `git` namespace (other SSHSIG namespaces always ask).
+        assert!(allow_key("SHA256:k", &None, "git signing", &peer, &[]).is_some());
+        assert!(allow_key("SHA256:k", &None, "git signing", &peer, &bind.via).is_none());
+        assert!(allow_key("SHA256:k", &None, "file signing", &peer, &[]).is_none());
+        assert!(allow_key("SHA256:k", &None, "unverified data", &peer, &[]).is_none());
+        assert!(allow_key("SHA256:k", &None, "git signing", &None, &[]).is_none());
+        // A git window and a login window for the same key never cover each other.
+        assert_ne!(allow_key("SHA256:k", &None, "git signing", &peer, &[]), allow_key("SHA256:k", &host, "login", &peer, &[]));
         assert!(allow_key("SHA256:k", &host, "login", &None, &[]).is_none());
     }
 

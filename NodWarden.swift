@@ -402,6 +402,9 @@ final class Core: ObservableObject {
         lockCount += 1
         send(["op": "lock"])
     }
+
+    /// Asks the core for a new reusable pairing token, shown once (#27).
+    func newToken() { send(["op": "new_token"]) }
 }
 
 // MARK: - Presence check
@@ -410,15 +413,25 @@ final class Core: ObservableObject {
 /// (the watch would need `.deviceOwnerAuthenticationWithBiometricsOrWatch`).
 /// A script with Accessibility access can click and type, but cannot touch the sensor.
 /// The caller creates the context first so it can recognise this exact prompt later (#7).
-func confirmPresence(_ ctx: LAContext, _ reason: String, _ done: @escaping (Bool) -> Void) {
+func confirmPresence(_ ctx: LAContext, _ reason: String, _ done: @escaping (Bool, String?) -> Void) {
     ctx.localizedFallbackTitle = ""
     var error: NSError?
     guard ctx.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else {
-        DispatchQueue.main.async { done(false) }
+        DispatchQueue.main.async { done(false, unavailableReason(error)) }
         return
     }
     ctx.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { ok, _ in
-        DispatchQueue.main.async { done(ok) }
+        DispatchQueue.main.async { done(ok, nil) }
+    }
+}
+
+/// Why Touch ID can't run right now, in words (#28). Without it nothing can be approved.
+func unavailableReason(_ error: NSError?) -> String {
+    switch LAError.Code(rawValue: error?.code ?? 0) {
+    case .biometryLockout: return "Touch ID is locked after failed tries. Unlock your Mac with its password, then try again."
+    case .biometryNotEnrolled: return "No fingerprint is set up. Add one in System Settings → Touch ID & Password."
+    case .biometryNotAvailable: return "Touch ID isn't available (lid closed or no sensor). Open the lid to approve."
+    default: return "Touch ID isn't available right now."
     }
 }
 
@@ -525,6 +538,8 @@ struct IslandView: View {
     static let rearmDelay: TimeInterval = 2
     /// Request whose Touch ID just succeeded; drives the red fill.
     @State private var granted: Int?
+    /// Shown under the buttons when Touch ID can't run (#28); cleared on the next attempt.
+    @State private var touchIDProblem: String?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let notch = Notch.current
 
@@ -557,7 +572,8 @@ struct IslandView: View {
         case .compact: return CGSize(width: max(notch.width, 120) + ear * 2, height: notch.height)
         case .result: return CGSize(width: max(notch.width + 140, 360), height: notch.height + resultRow)
         case .expanded:
-            return CGSize(width: max(notch.width + 200, 440), height: notch.height + (current != nil ? 106 : 104))
+            return CGSize(width: max(notch.width + 200, 440),
+                          height: notch.height + (current != nil ? 106 + (touchIDProblem != nil ? 30 : 0) : 104))
         }
     }
 
@@ -613,6 +629,7 @@ struct IslandView: View {
         prompt = nil
         confirming = false
         granted = nil
+        touchIDProblem = nil
     }
 
     /// Status panel folds back once the pointer has been away for a moment.
@@ -771,8 +788,8 @@ struct IslandView: View {
             HStack(spacing: 8) {
                 Button("Deny") { cancelPrompt(); core.decide(r, "deny") }.buttonStyle(Pill(.quiet))
                 Spacer(minLength: 0)
-                // Offered only when it would be remembered: not for git signing, unverified
-                // data or a forwarded request, which the core asks about every time.
+                // Offered only when the core would remember it: logins and git commit signing by
+                // a local program. Never for unverified data or a forwarded request.
                 if r.ssh?.canRemember ?? true {
                     HStack(spacing: 0) {
                         Button { cancelPrompt(); approve(r, minutes: minutes) } label: {
@@ -792,11 +809,21 @@ struct IslandView: View {
                             Image(systemName: "chevron.up.chevron.down").font(.system(size: 10, weight: .bold))
                         }
                         .buttonStyle(Pill(.quiet, flat: true, compact: true))
+                        // The duration can't change while Touch ID is up: what you touch for is
+                        // what was on screen when the prompt opened (#25).
+                        .disabled(confirming)
                         .accessibilityLabel("Change auto-allow duration")
                     }
                     .background(.white.opacity(0.14), in: Capsule())
                 }
                 AllowButton(waiting: confirming, filled: granted == r.id) { approve(r, minutes: nil) }
+            }
+            if let why = touchIDProblem {
+                Text(why)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.orange.opacity(0.9))
+                    .lineLimit(2)
+                    .transition(.blurSwap(y: -4))
             }
         }
         .padding(.top, notch.height + 10)
@@ -835,7 +862,8 @@ struct IslandView: View {
                     }
                     .buttonStyle(Pill(.quiet))
                 }
-            } else if case .offline = core.state, let last = core.log.last {
+            } else if let last = core.log.last {
+                // The latest message from the core, so errors are visible in every state (#28).
                 Text(last).font(.system(size: 11)).foregroundStyle(.orange.opacity(0.8)).lineLimit(2)
             }
             HStack {
@@ -843,8 +871,11 @@ struct IslandView: View {
                 ZStack {
                     switch core.state {
                     case .unlocked:
-                        Button("Lock") { core.lock() }.buttonStyle(Pill(.quiet))
-                            .transition(.blurSwap(y: 6))
+                        HStack(spacing: 8) {
+                            Button("New agent token") { core.newToken() }.buttonStyle(Pill(.quiet))
+                            Button("Lock") { core.lock() }.buttonStyle(Pill(.quiet))
+                        }
+                        .transition(.blurSwap(y: 6))
                     case .locked:
                         Button(core.unlocking ? "Waiting for Touch ID…" : "Unlock with Touch ID") { core.unlock() }
                             .buttonStyle(Pill(.primary))
@@ -873,7 +904,7 @@ struct IslandView: View {
             let target: String
             switch s.purpose {
             case "login": target = "log in to \(r.title) with \(s.key)"
-            case "git signing": target = "sign a git commit with \(s.key)"
+            case "git signing": target = m == nil ? "sign a git commit with \(s.key)" : "sign git commits with \(s.key)"
             case "unverified data": target = "sign unverified data with \(s.key)"
             default: target = "use \(s.key) for \(s.purpose)"
             }
@@ -885,12 +916,17 @@ struct IslandView: View {
         }
         let ctx = LAContext()
         prompt = ctx
-        confirmPresence(ctx, what) { ok in
+        touchIDProblem = nil
+        // The window length is fixed now; the prompt text already names it (#25).
+        let frozenMinutes = m
+        confirmPresence(ctx, what) { ok, problem in
             // Ignore a stale answer: this exact prompt was cancelled or replaced meanwhile (#7).
             guard prompt === ctx else { return }
             prompt = nil
             confirming = false
+            if let problem { withAnimation(springSwap) { touchIDProblem = problem } }
             guard ok, core.queue.contains(where: { $0.id == r.id }) else { return }
+            let m = frozenMinutes
             if let m {
                 minutes = m
                 core.decide(r, "approve_for", minutes: m)
@@ -1142,6 +1178,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DistributedNotificationCenter.default().addObserver(forName: .init("com.apple.screenIsLocked"), object: nil, queue: .main, using: lockNow)
         // Fast user switching: someone else now has the screen and this session runs on behind it.
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.sessionDidResignActiveNotification, object: nil, queue: .main, using: lockNow)
+        startIdleLock()
         signal(SIGTERM, SIG_IGN)
         sigterm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
         sigterm?.setEventHandler { NSApp.terminate(nil) }
@@ -1153,6 +1190,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.core.unlock() }
             .store(in: &cancellables)
+    }
+
+    /// Locks after this many minutes with no keyboard or mouse input (#26), so no vault session
+    /// or Allow window outlives you walking away with the screen on. `defaults write
+    /// io.github.nodwarden idleLockMinutes -int N` changes it; 0 turns it off.
+    var idleLockMinutes: Double {
+        let v = UserDefaults.standard.object(forKey: "idleLockMinutes") as? Double
+        return v ?? 15
+    }
+    var idleTimer: Timer?
+    func startIdleLock() {
+        let t = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+            guard let self, self.idleLockMinutes > 0, self.core.state == .unlocked else { return }
+            let anyInput = CGEventType(rawValue: ~0)!
+            let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: anyInput)
+            if idle >= self.idleLockMinutes * 60 { self.core.lock() }
+        }
+        t.tolerance = 10
+        RunLoop.main.add(t, forMode: .common)
+        idleTimer = t
     }
 
     func place(w: CGFloat, h: CGFloat) {

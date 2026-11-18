@@ -54,6 +54,8 @@ enum Cmd {
     Unlock { session: bw::Secret },
     Decide { id: u64, decision: String, minutes: Option<u32> },
     Lock,
+    /// Mint a new reusable pairing token and show it once (#27). Needs the relay.
+    NewToken,
 }
 
 /// A credential request waiting for the user. Nothing secret is kept (#1): the lookup
@@ -340,6 +342,12 @@ impl Core {
                         let _ = tx.send(Done::UnlockFailed("session rejected".into())).await;
                         return;
                     }
+                    // Pick up items added elsewhere since the last sync (#30). A failed sync
+                    // (offline) is not fatal: the local copy still works.
+                    match bw.run(Some(&session), &["sync"]).await {
+                        Ok(o) if o.ok => {}
+                        _ => emit(json!({"ev":"log","msg":"bw sync failed; using the local copy of the vault"})),
+                    }
                     let keys = match ssh_agent::load_keys(&bw, &session).await {
                         Ok(k) => k,
                         Err(e) => {
@@ -351,6 +359,8 @@ impl Core {
                 });
             }
             Cmd::Lock => self.lock_all("").await,
+            // Handled in run(): it needs the relay client.
+            Cmd::NewToken => {}
             Cmd::Decide { id, decision, minutes } => {
                 let approve = matches!(decision.as_str(), "approve" | "approve_for");
                 let window = (decision == "approve_for")
@@ -555,39 +565,8 @@ async fn run() -> Result<(), String> {
         std::process::exit(0);
     });
 
-    // "locked" is said once the relay is reached ("listening"): the UI asks for the unlock
-    // Touch ID on the first "locked", and that is wasted on a core about to exit offline.
-    emit(json!({"ev":"status","state":"connecting"}));
-
-    let identity = FileIdentityStorage::load_or_generate("user_client").map_err(|e| e.to_string())?;
-    let store = FileConnectionCache::load_or_create("user_client").map_err(|e| e.to_string())?;
-    let psk_store = FilePskStore::load_or_create("user_client").map_err(|e| e.to_string())?;
-    let existing = PskStore::list(&psk_store).await;
-    tighten_access_protocol_perms();
-
-    let handle = UserClient::connect(
-        Box::new(identity),
-        Box::new(store),
-        Box::new(DefaultProxyClient::from_url(PROXY_URL.to_string())),
-        None,
-        Some(Box::new(psk_store)),
-    )
-    .await
-    .map_err(|e| format!("relay: {e}"))?;
-
-    let client = handle.client;
-    let mut notes = handle.notifications;
-    let mut requests = handle.requests;
-
-    if existing.is_empty() {
-        // First run: mint the reusable PSK agents pair with, and show it once (#19).
-        let token = client.get_psk_token(None, true).await.map_err(|e| e.to_string())?;
-        emit(json!({"ev":"token","token":token}));
-        tighten_access_protocol_perms();
-    }
-    emit(json!({"ev":"status","state":"listening"}));
-    emit(json!({"ev":"status","state":"locked"}));
-
+    // The SSH agent and unlock work without the relay (#24): start them first and connect
+    // in the background. "locked" right away; relay state is reported on its own.
     let (done_tx, mut done_rx) = mpsc::channel::<Done>(32);
     let (ssh_tx, mut ssh_rx) = mpsc::channel::<ssh_agent::SignAsk>(16);
     let mut core = Core::new(bw.clone(), done_tx, spawn_locker(bw));
@@ -599,15 +578,103 @@ async fn run() -> Result<(), String> {
             }
         });
     }
+    emit(json!({"ev":"status","state":"locked"}));
+    emit(json!({"ev":"status","state":"connecting"}));
 
+    let identity = FileIdentityStorage::load_or_generate("user_client").map_err(|e| e.to_string())?;
+    let store = FileConnectionCache::load_or_create("user_client").map_err(|e| e.to_string())?;
+    let psk_store = FilePskStore::load_or_create("user_client").map_err(|e| e.to_string())?;
+    let existing = PskStore::list(&psk_store).await;
+    tighten_access_protocol_perms();
+
+    // Connect to the relay in the background, retrying with backoff; the agent keeps working.
+    let (relay_tx, mut relay_rx) = mpsc::channel::<Result<ap_client::UserClientHandle, String>>(1);
+    {
+        let mut parts = Some((identity, store, psk_store));
+        tokio::spawn(async move {
+            let mut delay = Duration::from_secs(2);
+            loop {
+                let (identity, store, psk_store) = match parts.take() {
+                    Some(p) => p,
+                    None => match (
+                        FileIdentityStorage::load_or_generate("user_client"),
+                        FileConnectionCache::load_or_create("user_client"),
+                        FilePskStore::load_or_create("user_client"),
+                    ) {
+                        (Ok(i), Ok(s), Ok(p)) => (i, s, p),
+                        _ => {
+                            let _ = relay_tx.send(Err("cannot read ~/.access-protocol".into())).await;
+                            return;
+                        }
+                    },
+                };
+                match UserClient::connect(
+                    Box::new(identity),
+                    Box::new(store),
+                    Box::new(DefaultProxyClient::from_url(PROXY_URL.to_string())),
+                    None,
+                    Some(Box::new(psk_store)),
+                )
+                .await
+                {
+                    Ok(h) => {
+                        let _ = relay_tx.send(Ok(h)).await;
+                        return;
+                    }
+                    Err(e) => {
+                        emit(json!({"ev":"status","state":"connecting","detail":format!("relay unreachable: {e}")}));
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(60));
+                    }
+                }
+            }
+        });
+    }
+
+    let mut client: Option<UserClient> = None;
+    let mut notes: Option<mpsc::Receiver<UserClientNotification>> = None;
+    let mut requests: Option<mpsc::Receiver<UserClientRequest>> = None;
+    let mut minted_first = !existing.is_empty();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
 
     loop {
         tokio::select! {
-            Some(cmd) = cmd_rx.recv() => core.on_cmd(cmd).await,
+            Some(cmd) = cmd_rx.recv() => match cmd {
+                Cmd::NewToken => match &client {
+                    // Mint a new reusable PSK (#27). Earlier tokens stay valid; this one is shown once.
+                    Some(c) => match c.get_psk_token(None, true).await {
+                        Ok(token) => {
+                            emit(json!({"ev":"token","token":token}));
+                            tighten_access_protocol_perms();
+                        }
+                        Err(e) => emit(json!({"ev":"log","msg":format!("new token failed: {e}")})),
+                    },
+                    None => emit(json!({"ev":"log","msg":"new token needs the relay; try again when connected"})),
+                },
+                other => core.on_cmd(other).await,
+            },
             Some(done) = done_rx.recv() => core.on_done(done).await,
 
-            Some(req) = requests.recv() => match req {
+            Some(r) = relay_rx.recv() => match r {
+                Ok(h) => {
+                    if !minted_first {
+                        // First run: mint the reusable PSK agents pair with, and show it once (#19).
+                        match h.client.get_psk_token(None, true).await {
+                            Ok(token) => emit(json!({"ev":"token","token":token})),
+                            Err(e) => emit(json!({"ev":"log","msg":format!("pairing token: {e}")})),
+                        }
+                        tighten_access_protocol_perms();
+                        minted_first = true;
+                    }
+                    client = Some(h.client);
+                    notes = Some(h.notifications);
+                    requests = Some(h.requests);
+                    emit(json!({"ev":"status","state":"listening"}));
+                }
+                Err(e) => emit(json!({"ev":"log","msg":e})),
+            },
+
+            Some(req) = async { requests.as_mut()?.recv().await }, if requests.is_some() => match req {
                 UserClientRequest::VerifyFingerprint { reply, .. } => {
                     // Only rendezvous pairing asks this; we only accept PSK pairing.
                     let _ = reply.send(FingerprintVerificationReply { approved: false, name: None });
@@ -619,7 +686,7 @@ async fn run() -> Result<(), String> {
 
             Some(ask) = ssh_rx.recv() => core.on_ssh_ask(ask),
 
-            Some(n) = notes.recv() => match n {
+            Some(n) = async { notes.as_mut()?.recv().await }, if notes.is_some() => match n {
                 // The relay going away does not change the vault state: keys stay loaded and the
                 // SSH agent keeps answering, so the UI must keep showing the lock state (and Lock).
                 // ap-client reconnects by itself, for as long as it takes.
