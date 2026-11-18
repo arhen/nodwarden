@@ -15,9 +15,9 @@ is asking, and is released only after you approve it with Touch ID.
 NodWarden is a macOS front end for [Bitwarden Agent Access](https://github.com/bitwarden/agent-access).
 Agents use the standard `aac` client; NodWarden replaces the listener on your Mac.
 
-> [!IMPORTANT]
-> Agent Access is in **early preview**, and so is NodWarden. Don't paste secrets into an LLM chat.
-> Use environment injection (`aac run`) so the secret goes to the process, never into the model's context.
+> [!NOTE]
+> NodWarden builds on Bitwarden Agent Access, which is in **early preview**. Its protocol may change.
+> Always use `aac run`, so the secret goes to the process, never into the model's context.
 
 <p align="center">
   <picture>
@@ -127,7 +127,7 @@ flowchart LR
 
 </details>
 
-### Why it's hard to bypass
+### What it protects against
 
 | Attack | Why it fails |
 |---|---|
@@ -177,18 +177,32 @@ aac run --id <vault-item-uuid> --env DB_PASS=password -- ./deploy.sh
 When more than one vault item matches a domain, the request is denied. Use `--id`.
 Don't use `aac connect --output json` for real secrets: it prints them to stdout.
 
-## Known limits
+## Security model
 
-- **An agent running as your macOS user can ask for Touch ID itself.** It runs `bw unlock --raw`
-  or `bwbio unlock --raw`, and Bitwarden Desktop shows its usual *"unlock your vault"* prompt.
-  If you touch it, the agent gets the whole vault. NodWarden doesn't cause this and can't block it:
-  - Bitwarden Desktop accepts unlock requests from any program running as you.
-  - Its prompt always has the same text, so you can't see who asked.
-  - macOS lets programs running as the same user reach each other.
+### What NodWarden guarantees
 
-  **Fix:** run agents as a separate macOS user, or in a VM or container. They can't reach your
-  Desktop app, but they can still request secrets through NodWarden. If they run as you, never
-  touch a Touch ID prompt that NodWarden didn't start.
+- An agent never receives your vault or a vault session, only the one item you approved.
+- No request is released without Touch ID, and nothing but NodWarden can approve one.
+- You see the site, username, 2FA and requesting device before you decide.
+- Secrets go into the agent's child process environment, never to stdout or the model's context.
+
+### What's outside any app's control
+
+NodWarden can only control what goes through NodWarden. One thing doesn't: **Bitwarden Desktop's own
+Touch ID unlock.** Any program running as your macOS user can ask Desktop to unlock the vault
+(that's how the browser extension, `bwbio` and `bw unlock` all work), and the prompt reads the same
+*"unlock your vault"* no matter who asked.
+
+This is true on any Mac with Bitwarden Desktop and Touch ID enabled, with or without NodWarden.
+NodWarden doesn't add it and doesn't widen it. Two ways to handle it:
+
+- **Best:** run agents as a separate macOS user, or in a VM or container. They can't reach your
+  Desktop app at all, and they still get secrets through NodWarden.
+- **Simple:** only touch Touch ID prompts that NodWarden started. NodWarden always shows its
+  request in the notch first.
+
+### Compatibility notes
+
 - Vaultwarden older than 1.37.4 can't log in with `bw` 2026.9.0+ (`KeyIdBackfillError`).
   Upgrade the server, or pin `bw` 2026.8.0.
 - Agent Access is an early preview. Its protocol may change.
@@ -222,9 +236,10 @@ but it does see connection metadata.
 **Does it work with Vaultwarden? 1Password?**
 It works with both bitwarden.com and Vaultwarden. 1Password isn't supported; its CLI has its own approval prompt.
 
-**Is it fully secure?**
-No. The main gap comes from Bitwarden Desktop, not NodWarden: any program running as you can trigger
-its Touch ID unlock. Run agents as a separate macOS user to close it. See [Known limits](#known-limits).
+**Is it secure?**
+For everything that goes through it, yes: agents get one approved item, never the vault, and only Touch ID
+releases it. It can't control Bitwarden Desktop's own Touch ID unlock, which any program running as you
+can trigger. Run agents as a separate macOS user to rule that out. See [Security model](#security-model).
 
 ## License
 
