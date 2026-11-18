@@ -230,6 +230,9 @@ struct Core {
     /// value and is thrown away when it finishes, so a lock always wins over work in flight.
     epoch: u64,
     pending: HashMap<u64, (Pending, ItemInfo)>,
+    /// Lookups still running, per device. Counted with `pending` against
+    /// MAX_PENDING_PER_DEVICE, or a burst would get past the limit before anything is waiting.
+    looking: HashMap<IdentityFingerprint, usize>,
     /// (device, item id) -> allowed until. Keyed on the item, not the query (#22).
     approvals: HashMap<(IdentityFingerprint, String), Instant>,
     ssh_state: ssh_agent::Shared,
@@ -260,6 +263,7 @@ impl Core {
             session: None,
             epoch: 0,
             pending: HashMap::new(),
+            looking: HashMap::new(),
             approvals: HashMap::new(),
             ssh_state: Default::default(),
             ssh_pending: HashMap::new(),
@@ -373,6 +377,12 @@ impl Core {
                 }
             }
             Done::Looked { id, identity, query_key, kind, reply, result } => {
+                if let std::collections::hash_map::Entry::Occupied(mut n) = self.looking.entry(identity) {
+                    *n.get_mut() -= 1;
+                    if *n.get() == 0 {
+                        n.remove();
+                    }
+                }
                 let info = match result {
                     Lookup::Found(i) => i,
                     Lookup::Locked => {
@@ -442,12 +452,14 @@ impl Core {
             emit(json!({"ev":"resolved","id":id,"outcome":"locked","query":search}));
             return;
         };
-        let waiting = self.pending.values().filter(|(p, _)| p.identity == identity).count();
+        let waiting = self.pending.values().filter(|(p, _)| p.identity == identity).count()
+            + self.looking.get(&identity).copied().unwrap_or(0);
         if waiting >= MAX_PENDING_PER_DEVICE {
             let _ = reply.send(deny_reply());
             emit(json!({"ev":"log","msg":"too many waiting requests from one device; denied"}));
             return;
         }
+        *self.looking.entry(identity).or_default() += 1;
         let kind = match query {
             CredentialQuery::Domain(_) => "domain",
             CredentialQuery::Id(_) => "id",
@@ -671,6 +683,35 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         core.on_done(Done::Released { epoch: core.epoch, id: 2, reply: tx, cred: Some(credential()), auto: false, domain: None }).await;
         assert!(rx.await.unwrap().approved);
+    }
+
+    #[tokio::test]
+    async fn a_burst_from_one_device_is_capped_while_lookups_are_still_running() {
+        let (mut core, mut done, _locks) = test_core();
+        core.session = Some(session());
+        let (device, other) = (IdentityFingerprint([1; 32]), IdentityFingerprint([2; 32]));
+        let mut replies = Vec::new();
+        for _ in 0..MAX_PENDING_PER_DEVICE + 2 {
+            let (tx, rx) = oneshot::channel();
+            core.on_credential_request(CredentialQuery::Domain("github.com".into()), device, tx);
+            replies.push(rx);
+        }
+        // Nothing has been looked up yet, and the two over the limit are already refused.
+        let refused = replies.iter_mut().filter_map(|r| r.try_recv().ok()).filter(|r| !r.approved).count();
+        assert_eq!(refused, 2);
+        assert_eq!(core.looking.get(&device), Some(&MAX_PENDING_PER_DEVICE));
+
+        // Another device is not affected.
+        let (tx, mut rx) = oneshot::channel();
+        core.on_credential_request(CredentialQuery::Domain("github.com".into()), other, tx);
+        assert!(rx.try_recv().is_err(), "the other device was refused");
+
+        // Each finished lookup frees its slot.
+        for _ in 0..MAX_PENDING_PER_DEVICE + 1 {
+            let d = done.recv().await.unwrap();
+            core.on_done(d).await;
+        }
+        assert!(core.looking.is_empty() && core.pending.is_empty());
     }
 
     #[tokio::test]
