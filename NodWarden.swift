@@ -13,6 +13,20 @@ struct CredRequest: Identifiable, Equatable {
     let byId: Bool
     let arrived: Date
     let timeout: Double
+    /// Set for SSH agent requests: key name, purpose, and calling program.
+    var ssh: SSHInfo? = nil
+}
+
+struct SSHInfo: Equatable {
+    let key: String
+    let purpose: String
+    let app: String
+}
+
+/// The program behind a request: the nearest named ancestor that isn't a shell.
+func requestingApp(_ chain: [String]) -> String {
+    let skip: Set<String> = ["ssh", "ssh-keygen", "git", "git-remote-https", "bash", "zsh", "sh", "fish", "login", "sudo", "env", "xargs"]
+    return chain.first { !skip.contains($0) } ?? chain.first ?? "unknown app"
 }
 
 enum VaultState: Equatable { case starting, locked, unlocked, offline(String) }
@@ -120,6 +134,23 @@ final class Core: ObservableObject {
                 byId: (e["kind"] as? String) == "id",
                 arrived: Date(),
                 timeout: e["timeout"] as? Double ?? 110
+            )
+            queue.append(r)
+            NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+        case "ssh_request":
+            guard let id = e["id"] as? Int else { return }
+            let chain = e["process"] as? [String] ?? []
+            let purpose = e["purpose"] as? String ?? "signing"
+            let r = CredRequest(
+                id: id,
+                domain: (e["host"] as? String) ?? (purpose == "git signing" ? "Git commit" : "SSH"),
+                username: nil,
+                device: "",
+                hasTotp: false,
+                byId: false,
+                arrived: Date(),
+                timeout: e["timeout"] as? Double ?? 110,
+                ssh: SSHInfo(key: e["key"] as? String ?? "SSH key", purpose: purpose, app: requestingApp(chain))
             )
             queue.append(r)
             NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
@@ -468,7 +499,16 @@ struct IslandView: View {
     func requestView(_ r: CredRequest) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .center, spacing: 12) {
-                Favicon(domain: r.domain)
+                if r.ssh != nil {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 9, style: .continuous).fill(.white.opacity(0.12))
+                        Image(systemName: r.ssh?.purpose == "git signing" ? "signature" : "terminal.fill")
+                            .font(.system(size: 16, weight: .semibold))
+                    }
+                    .frame(width: 36, height: 36)
+                } else {
+                    Favicon(domain: r.domain)
+                }
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
                         Text(r.domain).font(.system(size: 15, weight: .semibold)).lineLimit(1)
@@ -569,7 +609,13 @@ struct IslandView: View {
     func approve(_ r: CredRequest, minutes m: Int?) {
         guard !confirming else { return }
         confirming = true
-        let what = m.map { "allow \(r.domain) for \(r.device) for \($0) minutes" } ?? "release \(r.domain) to \(r.device)"
+        let what: String
+        if let s = r.ssh {
+            let target = s.purpose == "git signing" ? "sign a git commit" : "use \(s.key) for \(r.domain)"
+            what = m.map { "let \(s.app) \(target) for \($0) minutes" } ?? "let \(s.app) \(target)"
+        } else {
+            what = m.map { "allow \(r.domain) for \(r.device) for \($0) minutes" } ?? "release \(r.domain) to \(r.device)"
+        }
         let ctx = confirmPresence(what) { ok in
             // Ignore a stale answer: the request was decided or replaced meanwhile.
             guard prompt?.id == r.id else { return }
@@ -593,6 +639,7 @@ struct IslandView: View {
     }
 
     func detailLine(_ r: CredRequest) -> String {
+        if let s = r.ssh { return "\(s.key)  ·  \(s.purpose)  ·  \(s.app)" }
         var parts = [r.username ?? "no username"]
         if r.hasTotp { parts.append("+ 2FA") }
         parts.append("→ \(r.device)")
@@ -870,6 +917,12 @@ func snapshot(to dir: String) {
     shot("2-hover", true) { $0.state = .unlocked }
     shot("3-request", waiting: true) { $0.state = .unlocked; $0.queue = [sample] }
     shot("3a-cancelled") { $0.state = .unlocked; $0.queue = [sample] }
+    shot("3c-ssh", waiting: true) {
+        $0.state = .unlocked
+        $0.queue = [CredRequest(id: 2, domain: "github.com", username: nil, device: "", hasTotp: false, byId: false,
+                                arrived: Date(), timeout: 110,
+                                ssh: SSHInfo(key: "Personal Github Key", purpose: "login", app: "pi"))]
+    }
     shot("3b-touched", granted: 1, waiting: true) { $0.state = .unlocked; $0.queue = [sample] }
     shot("4-queue") { $0.state = .unlocked; $0.queue = [sample, sample] }
     shot("5-approved") { $0.state = .unlocked; $0.outcome = .approved("github.com") }

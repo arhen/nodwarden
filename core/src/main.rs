@@ -14,6 +14,7 @@
 //!          {"ev":"log","msg":...}
 //! Secrets never go to stdout.
 
+mod ssh_agent;
 mod storage;
 
 use std::collections::HashMap;
@@ -204,12 +205,32 @@ async fn run() -> Result<(), String> {
     let mut next_id: u64 = 1;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
 
+    // SSH agent: keys load on unlock, every signature waits for the island.
+    let ssh_state: ssh_agent::Shared = Default::default();
+    let (ssh_tx, mut ssh_rx) = mpsc::channel::<ssh_agent::SignAsk>(16);
+    {
+        let (st, tx) = (ssh_state.clone(), ssh_tx.clone());
+        tokio::spawn(async move {
+            if let Err(e) = ssh_agent::serve(st, tx).await {
+                emit(json!({"ev":"log","msg":format!("ssh agent: {e}")}));
+            }
+        });
+    }
+    let mut ssh_pending: HashMap<u64, (ssh_agent::SignAsk, Instant)> = HashMap::new();
+
     loop {
         tokio::select! {
             Some(cmd) = cmd_rx.recv() => match cmd {
                 Cmd::Unlock { session: s } => {
                     let s = SecretString::from(s);
                     if bw_status(&bw, Some(&s)).await.as_deref() == Some("unlocked") {
+                        match ssh_agent::load_keys(&s).await {
+                            Ok(keys) => {
+                                emit(json!({"ev":"log","msg":format!("ssh agent: {} keys", keys.len())}));
+                                ssh_state.lock().await.keys = keys;
+                            }
+                            Err(e) => emit(json!({"ev":"log","msg":format!("ssh agent: {e}")})),
+                        }
                         session = Some(s);
                         emit(json!({"ev":"status","state":"unlocked"}));
                     } else {
@@ -219,6 +240,15 @@ async fn run() -> Result<(), String> {
                 Cmd::Lock => {
                     session = None;
                     approvals.clear();
+                    {
+                        let mut st = ssh_state.lock().await;
+                        st.keys.clear();
+                        st.allowed.clear();
+                    }
+                    for (id, (ask, _)) in ssh_pending.drain() {
+                        let _ = ask.reply.send(false);
+                        emit(json!({"ev":"resolved","id":id,"outcome":"denied"}));
+                    }
                     for (id, p) in pending.drain() {
                         let _ = p.reply.send(CredentialRequestReply { approved: false, credential: None, credential_id: None });
                         emit(json!({"ev":"resolved","id":id,"outcome":"denied"}));
@@ -226,6 +256,16 @@ async fn run() -> Result<(), String> {
                     emit(json!({"ev":"status","state":"locked"}));
                 }
                 Cmd::Decide { id, decision, minutes } => {
+                    if let Some((ask, _)) = ssh_pending.remove(&id) {
+                        let approve = decision == "approve" || decision == "approve_for";
+                        if decision == "approve_for" {
+                            let mins = u64::from(minutes.unwrap_or(10).clamp(1, 240));
+                            ssh_agent::allow_for(&ssh_state, &ask.fingerprint, &ask.process, Instant::now() + Duration::from_secs(mins * 60)).await;
+                        }
+                        let _ = ask.reply.send(approve);
+                        emit(json!({"ev":"resolved","id":id,"outcome": if approve {"approved"} else {"denied"}}));
+                        continue;
+                    }
                     let Some(p) = pending.remove(&id) else { continue };
                     let cred_id = p.credential.credential_id.clone();
                     let approve = decision == "approve" || decision == "approve_for";
@@ -305,6 +345,18 @@ async fn run() -> Result<(), String> {
                 }
             },
 
+            Some(ask) = ssh_rx.recv() => {
+                let id = next_id;
+                next_id += 1;
+                if session.is_none() {
+                    let _ = ask.reply.send(false);
+                    emit(json!({"ev":"resolved","id":id,"outcome":"locked","query":ask.key_name}));
+                    continue;
+                }
+                emit(ssh_agent::ask_json(id, &ask));
+                ssh_pending.insert(id, (ask, Instant::now() + REQUEST_TIMEOUT));
+            },
+
             Some(n) = notes.recv() => match n {
                 UserClientNotification::Reconnecting { attempt } =>
                     emit(json!({"ev":"status","state":"connecting","detail":format!("reconnecting ({attempt})")})),
@@ -324,6 +376,13 @@ async fn run() -> Result<(), String> {
                 for id in expired {
                     if let Some(p) = pending.remove(&id) {
                         let _ = p.reply.send(CredentialRequestReply { approved: false, credential: None, credential_id: None });
+                        emit(json!({"ev":"resolved","id":id,"outcome":"expired"}));
+                    }
+                }
+                let ssh_expired: Vec<u64> = ssh_pending.iter().filter(|(_, (_, d))| *d <= now).map(|(k, _)| *k).collect();
+                for id in ssh_expired {
+                    if let Some((ask, _)) = ssh_pending.remove(&id) {
+                        let _ = ask.reply.send(false);
                         emit(json!({"ev":"resolved","id":id,"outcome":"expired"}));
                     }
                 }
