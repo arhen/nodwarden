@@ -81,7 +81,7 @@ pub struct SignAsk {
     /// Verified host for a login; None for anything else.
     pub host: Option<String>,
     pub user: Option<String>,
-    /// "login", "git signing", "signing (namespace)", or "unverified data".
+    /// "login", "<namespace> signing" (e.g. "git signing"), or "unverified data".
     pub purpose: String,
     /// The program that connected, and its ancestors (nearest first), as a hint.
     pub peer: Option<Peer>,
@@ -182,8 +182,11 @@ pub async fn load_keys(bw: &Bw, session: &secrecy::SecretString) -> Result<Vec<K
 }
 
 pub async fn serve(state: Shared, asks: mpsc::Sender<SignAsk>) -> Result<(), String> {
+    serve_at(socket_path()?, state, asks).await
+}
+
+async fn serve_at(path: PathBuf, state: Shared, asks: mpsc::Sender<SignAsk>) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
-    let path = socket_path()?;
     let dir = path.parent().ok_or("bad socket path")?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| format!("chmod {}: {e}", dir.display()))?;
@@ -213,6 +216,7 @@ const MAX_HOPS: usize = 8;
 /// One verified `session-bind@openssh.com`.
 struct SessionBind {
     host: String,
+    hostkey: Vec<u8>,
     session_id: Vec<u8>,
     forwarding: bool,
 }
@@ -220,8 +224,9 @@ struct SessionBind {
 /// What the verified binds on one connection say about it.
 #[derive(Default)]
 struct Bind {
-    /// The host a login on this connection is for.
+    /// The host a login on this connection is for, and its key blob.
     host: Option<String>,
+    hostkey: Vec<u8>,
     session_id: Vec<u8>,
     /// Hosts this connection was forwarded through, nearest first.
     via: Vec<String>,
@@ -241,6 +246,7 @@ impl Bind {
             self.via.push(b.host);
         } else {
             self.host = Some(b.host);
+            self.hostkey = b.hostkey;
             self.session_id = b.session_id;
         }
         true
@@ -287,43 +293,74 @@ async fn identities(state: &Shared) -> Vec<u8> {
     r
 }
 
-/// Labels the data to be signed from its own content (#2).
-fn classify(data: &[u8], bind: &Bind) -> (String, Option<String>, Option<String>) {
+/// Labels the data to be signed from its own content (#2): (purpose, host, user).
+/// The purpose is "login", "<namespace> signing" (e.g. "git signing") or "unverified data".
+fn classify(data: &[u8], bind: &Bind, key_blob: &[u8]) -> (String, Option<String>, Option<String>) {
     if let Some(ns) = sshsig_namespace(data) {
-        let purpose = if ns == "git" { "git signing".to_string() } else { format!("signing ({ns})") };
-        return (purpose, None, None);
+        return (format!("{ns} signing"), None, None);
     }
-    if let (Some(host), Some(user)) = (&bind.host, userauth_user(data, &bind.session_id)) {
+    if let (Some(host), Some(user)) = (&bind.host, userauth_user(data, bind, key_blob)) {
         return ("login".into(), Some(host.clone()), Some(user));
     }
     ("unverified data".into(), None, None)
 }
 
-/// SSHSIG namespace, if `data` is an OpenSSH signature blob (PROTOCOL.sshsig).
-fn sshsig_namespace(data: &[u8]) -> Option<String> {
-    let rest = data.strip_prefix(b"SSHSIG")?;
-    let mut rd = Reader(rest);
-    let ns = rd.string()?;
-    String::from_utf8(ns).ok().filter(|s| !s.is_empty() && s.len() <= 64)
+/// Whether a string from the requester is safe to put in the prompt as is: short, visible
+/// ASCII, so it can't push the verified part out of view or imitate other text.
+fn printable(s: &str, max: usize) -> bool {
+    !s.is_empty() && s.len() <= max && s.bytes().all(|b| b.is_ascii_graphic())
 }
 
-/// The user name, if `data` is a publickey userauth request for this bound session.
-fn userauth_user(data: &[u8], session_id: &[u8]) -> Option<String> {
-    if session_id.is_empty() {
+/// SSHSIG namespace, if `data` is exactly what `ssh-keygen -Y sign` signs (PROTOCOL.sshsig):
+/// "SSHSIG", string namespace, string reserved, string hash algorithm, string H(message).
+fn sshsig_namespace(data: &[u8]) -> Option<String> {
+    let mut rd = Reader(data.strip_prefix(b"SSHSIG")?);
+    let ns = String::from_utf8(rd.string()?).ok()?;
+    let _reserved = rd.string()?;
+    let hash_len = match rd.string()?.as_slice() {
+        b"sha256" => 32,
+        b"sha512" => 64,
+        _ => return None,
+    };
+    if rd.string()?.len() != hash_len || !rd.0.is_empty() {
+        return None;
+    }
+    let plain = ns.bytes().all(|b| b.is_ascii_alphanumeric() || b"@._-".contains(&b));
+    (plain && printable(&ns, 32)).then_some(ns)
+}
+
+/// The user name, if `data` is exactly the publickey userauth request OpenSSH signs
+/// (RFC 4252 §7, or the host-bound variant in PROTOCOL) for this bound session and this key.
+/// The same checks as `parse_userauth_request` in OpenSSH's ssh-agent.c.
+fn userauth_user(data: &[u8], bind: &Bind, key_blob: &[u8]) -> Option<String> {
+    if bind.session_id.is_empty() {
         return None;
     }
     let mut rd = Reader(data);
-    if rd.string()? != session_id || rd.byte()? != SSH2_MSG_USERAUTH_REQUEST {
+    if rd.string()? != bind.session_id || rd.byte()? != SSH2_MSG_USERAUTH_REQUEST {
         return None;
     }
-    let user = rd.string()?;
-    let _service = rd.string()?;
-    // OpenSSH 8.9+ uses the host-bound variant whenever the server supports it.
+    let user = String::from_utf8(rd.string()?).ok()?;
+    if rd.string()? != b"ssh-connection" {
+        return None;
+    }
     let method = rd.string()?;
-    if method != b"publickey" && method != b"publickey-hostbound-v00@openssh.com" {
+    let has_signature = rd.byte()?;
+    let _algorithm = rd.string()?;
+    if has_signature != 1 || rd.string()? != key_blob {
         return None;
     }
-    String::from_utf8(user).ok()
+    match method.as_slice() {
+        b"publickey" => {}
+        // OpenSSH 8.9+ uses this variant whenever the server supports it; it repeats the host key.
+        b"publickey-hostbound-v00@openssh.com" => {
+            if rd.string()? != bind.hostkey {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    (rd.0.is_empty() && printable(&user, 64)).then_some(user)
 }
 
 async fn sign(
@@ -345,7 +382,7 @@ async fn sign(
             None => return vec![SSH_AGENT_FAILURE],
         }
     };
-    let (purpose, host, user) = classify(&data, bind);
+    let (purpose, host, user) = classify(&data, bind, &blob);
     let (peer, chain) = match pid {
         Some(p) => tokio::task::spawn_blocking(move || (anchor_of(p), chain_of(p))).await.unwrap_or((None, Vec::new())),
         None => (None, Vec::new()),
@@ -495,7 +532,7 @@ fn session_bind(body: &[u8]) -> Option<SessionBind> {
         key.verify(&session_id, &sig).ok()?;
     }
     let fp = key.fingerprint(HashAlg::Sha256).to_string();
-    Some(SessionBind { host: known_host_for(&fp).unwrap_or(fp), session_id, forwarding })
+    Some(SessionBind { host: known_host_for(&fp).unwrap_or(fp), hostkey, session_id, forwarding })
 }
 
 /// Maps a verified host key fingerprint to a hostname via ~/.ssh/known_hosts (unhashed entries).
@@ -658,36 +695,82 @@ mod tests {
         v
     }
 
+    fn sshsig(namespace: &[u8], hash_alg: &[u8], hash_len: usize) -> Vec<u8> {
+        let mut d = b"SSHSIG".to_vec();
+        d.extend(s(namespace));
+        d.extend(s(b""));
+        d.extend(s(hash_alg));
+        d.extend(s(&vec![7u8; hash_len]));
+        d
+    }
+
     #[test]
     fn sshsig_namespace_parsed() {
-        let mut d = b"SSHSIG".to_vec();
-        d.extend(s(b"git"));
-        assert_eq!(sshsig_namespace(&d).as_deref(), Some("git"));
+        assert_eq!(sshsig_namespace(&sshsig(b"git", b"sha512", 64)).as_deref(), Some("git"));
+        assert_eq!(sshsig_namespace(&sshsig(b"file", b"sha256", 32)).as_deref(), Some("file"));
+        assert_eq!(classify(&sshsig(b"git", b"sha512", 64), &Bind::default(), b"k").0, "git signing");
         assert_eq!(sshsig_namespace(b"not a sig"), None);
+        // Only the magic and a namespace, the rest missing or wrong: not what ssh-keygen signs.
+        let mut short = b"SSHSIG".to_vec();
+        short.extend(s(b"git"));
+        assert_eq!(sshsig_namespace(&short), None);
+        assert_eq!(sshsig_namespace(&sshsig(b"git", b"sha512", 32)), None);
+        assert_eq!(sshsig_namespace(&sshsig(b"git", b"md5", 16)), None);
+        let mut trailing = sshsig(b"git", b"sha512", 64);
+        trailing.push(0);
+        assert_eq!(sshsig_namespace(&trailing), None);
+        // A namespace is shown in the prompt, so it may not carry a message of its own.
+        assert_eq!(sshsig_namespace(&sshsig(b"git (safe, press Allow)", b"sha512", 64)), None);
+        assert_eq!(classify(&sshsig(b"x y", b"sha512", 64), &Bind::default(), b"k").0, "unverified data");
+    }
+
+    /// The data OpenSSH signs for publickey authentication.
+    fn userauth(sid: &[u8], user: &[u8], method: &[u8], key: &[u8], hostkey: Option<&[u8]>) -> Vec<u8> {
+        let mut d = s(sid);
+        d.push(SSH2_MSG_USERAUTH_REQUEST);
+        d.extend(s(user));
+        d.extend(s(b"ssh-connection"));
+        d.extend(s(method));
+        d.push(1);
+        d.extend(s(b"ssh-ed25519"));
+        d.extend(s(key));
+        if let Some(h) = hostkey {
+            d.extend(s(h));
+        }
+        d
     }
 
     #[test]
     fn login_needs_bound_session_id() {
-        let sid = b"session-123".to_vec();
-        let mut d = s(&sid);
-        d.push(SSH2_MSG_USERAUTH_REQUEST);
-        d.extend(s(b"git"));
-        d.extend(s(b"ssh-connection"));
-        d.extend(s(b"publickey"));
-        let bound = Bind { host: Some("github.com".into()), session_id: sid.clone(), via: Vec::new() };
-        assert_eq!(classify(&d, &bound), ("login".into(), Some("github.com".into()), Some("git".into())));
+        const HOSTBOUND: &[u8] = b"publickey-hostbound-v00@openssh.com";
+        let (sid, key, hostkey) = (b"session-123".to_vec(), b"my-key-blob".to_vec(), b"host-key-blob".to_vec());
+        let bound = Bind { host: Some("github.com".into()), hostkey: hostkey.clone(), session_id: sid.clone(), via: Vec::new() };
+        let login = ("login".to_string(), Some("github.com".to_string()), Some("git".to_string()));
+        let plain = userauth(&sid, b"git", b"publickey", &key, None);
+        assert_eq!(classify(&plain, &bound, &key), login);
         // The host-bound method modern OpenSSH actually sends.
-        let mut hb = s(&sid);
-        hb.push(SSH2_MSG_USERAUTH_REQUEST);
-        hb.extend(s(b"git"));
-        hb.extend(s(b"ssh-connection"));
-        hb.extend(s(b"publickey-hostbound-v00@openssh.com"));
-        assert_eq!(classify(&hb, &bound).0, "login");
+        let hostbound = userauth(&sid, b"git", HOSTBOUND, &key, Some(&hostkey));
+        assert_eq!(classify(&hostbound, &bound, &key), login);
+
+        let not_login = |data: &[u8], bind: &Bind| assert_eq!(classify(data, bind, &key).0, "unverified data");
         // Same data, but bound to another session: not a login for github.com.
-        let other = Bind { host: Some("github.com".into()), session_id: b"other".to_vec(), via: Vec::new() };
-        assert_eq!(classify(&d, &other).0, "unverified data");
+        let other = Bind { session_id: b"other".to_vec(), ..Bind { host: bound.host.clone(), ..Default::default() } };
+        not_login(&plain, &other);
         // No bind at all.
-        assert_eq!(classify(&d, &Bind::default()).0, "unverified data");
+        not_login(&plain, &Bind::default());
+        // A request to authenticate with some other key.
+        not_login(&userauth(&sid, b"git", b"publickey", b"another-key", None), &bound);
+        // Host-bound request that names a different server key than the one that signed the session.
+        not_login(&userauth(&sid, b"git", HOSTBOUND, &key, Some(b"evil-host-key")), &bound);
+        // Anything after the request, or another method.
+        let mut trailing = plain.clone();
+        trailing.extend(b"extra");
+        not_login(&trailing, &bound);
+        not_login(&userauth(&sid, b"git", b"hostbased", &key, None), &bound);
+        // A user name built to push the verified host out of view, or to read as other text.
+        not_login(&userauth(&sid, b"git@github.com               ", b"publickey", &key, None), &bound);
+        not_login(&userauth(&sid, "git\u{202e}".as_bytes(), b"publickey", &key, None), &bound);
+        not_login(&userauth(&sid, &[b'a'; 65], b"publickey", &key, None), &bound);
     }
 
     fn host_key() -> ssh_key::PrivateKey {
@@ -771,13 +854,146 @@ mod tests {
         assert!(!is_terminal_host("/opt/homebrew/bin/fish"));
     }
 
+    /// (purpose, host, user) of a request the test agent was asked to sign.
+    type Seen = (String, Option<String>, Option<String>);
+
+    /// A private agent on a temp socket, holding one key made by the real `ssh-keygen`.
+    /// Every request is approved and recorded.
+    struct TestAgent {
+        dir: PathBuf,
+        sock: PathBuf,
+        seen: Arc<std::sync::Mutex<Vec<Seen>>>,
+    }
+
+    impl Drop for TestAgent {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    const SSH_KEYGEN: &str = "/usr/bin/ssh-keygen";
+
+    async fn keygen(args: &[&str]) {
+        let st = tokio::process::Command::new(SSH_KEYGEN).args(args).output().await.unwrap();
+        assert!(st.status.success(), "ssh-keygen {args:?}: {}", String::from_utf8_lossy(&st.stderr));
+    }
+
+    async fn start_agent(tag: &str, key_type: &str) -> TestAgent {
+        let dir = std::env::temp_dir().join(format!("nw-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = dir.join("id");
+        keygen(&["-q", "-t", key_type, "-b", "2048", "-N", "", "-C", "test", "-f", id.to_str().unwrap()]).await;
+        let key = PrivateKey::read_openssh_file(&id).unwrap();
+        let mut blob = Vec::new();
+        key.public_key().key_data().encode(&mut blob).unwrap();
+        let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
+        let state: Shared = Arc::new(Mutex::new(State { keys: vec![Key { name: "test key".into(), key, blob, fingerprint }], ..Default::default() }));
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, mut rx) = mpsc::channel::<SignAsk>(4);
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Some(a) = rx.recv().await {
+                log.lock().unwrap().push((a.purpose.clone(), a.host.clone(), a.user.clone()));
+                let _ = a.reply.send(true);
+            }
+        });
+        let sock = dir.join("agent.sock");
+        tokio::spawn(serve_at(sock.clone(), state, tx));
+        for _ in 0..100 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        TestAgent { dir, sock, seen }
+    }
+
+    /// Real `ssh-keygen -Y sign` through the agent: the request is labelled from what OpenSSH
+    /// really sends, and OpenSSH accepts the signature we return (Ed25519, and the RSA path
+    /// that builds the key by hand).
+    #[tokio::test]
+    async fn real_ssh_keygen_signature_is_labelled_and_verifies() {
+        if !std::path::Path::new(SSH_KEYGEN).exists() {
+            eprintln!("no ssh-keygen; skipped");
+            return;
+        }
+        for key_type in ["ed25519", "rsa"] {
+            let agent = start_agent(&format!("sig-{key_type}"), key_type).await;
+            let (msg, public) = (agent.dir.join("msg"), agent.dir.join("id.pub"));
+            std::fs::write(&msg, "tree 1234\n\ncommit message\n").unwrap();
+            let sign = tokio::process::Command::new(SSH_KEYGEN)
+                .args(["-Y", "sign", "-n", "git", "-f", public.to_str().unwrap(), msg.to_str().unwrap()])
+                .env("SSH_AUTH_SOCK", &agent.sock)
+                .output()
+                .await
+                .unwrap();
+            assert!(sign.status.success(), "{key_type} sign: {}", String::from_utf8_lossy(&sign.stderr));
+            assert_eq!(*agent.seen.lock().unwrap(), [("git signing".to_string(), None, None)], "{key_type}");
+
+            let verify = tokio::process::Command::new(SSH_KEYGEN)
+                .args(["-Y", "check-novalidate", "-n", "git", "-f", public.to_str().unwrap(), "-s"])
+                .arg(agent.dir.join("msg.sig"))
+                .stdin(std::fs::File::open(&msg).unwrap())
+                .output()
+                .await
+                .unwrap();
+            assert!(verify.status.success(), "{key_type} verify: {}", String::from_utf8_lossy(&verify.stderr));
+        }
+    }
+
+    /// Real `ssh` logging in to a real `sshd` through the agent: the session-bind OpenSSH sends
+    /// verifies, and the userauth request it asks us to sign parses as a login for that host.
+    /// Starts sshd on 127.0.0.1 with a throwaway host key that only accepts the throwaway user
+    /// key, and runs `true` as the current user. Run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "starts a real sshd on 127.0.0.1"]
+    async fn real_ssh_login_is_labelled_a_login() {
+        let agent = start_agent("login", "ed25519").await;
+        let path = |name: &str| agent.dir.join(name).to_str().unwrap().to_owned();
+        keygen(&["-q", "-t", "ed25519", "-N", "", "-f", &path("hostkey")]).await;
+        std::fs::copy(agent.dir.join("id.pub"), agent.dir.join("authorized_keys")).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port().to_string();
+        let _sshd = tokio::process::Command::new("/usr/sbin/sshd")
+            .args(["-D", "-e", "-f", "/dev/null", "-p", &port, "-h", &path("hostkey")])
+            .args(["-o", "ListenAddress=127.0.0.1", "-o", "StrictModes=no", "-o", "UsePAM=no", "-o", "PidFile=none"])
+            .args(["-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no"])
+            .args(["-o", &format!("AuthorizedKeysFile={}", path("authorized_keys"))])
+            .stderr(std::fs::File::create(agent.dir.join("sshd.log")).unwrap())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let ssh = tokio::process::Command::new("/usr/bin/ssh")
+            .args(["-F", "/dev/null", "-p", &port, "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
+            .args(["-o", &format!("IdentityAgent={}", agent.sock.display()), "-o", "IdentityFile=none"])
+            .args(["-o", &format!("UserKnownHostsFile={}", path("known_hosts")), "-o", "GlobalKnownHostsFile=/dev/null"])
+            .args(["-o", "StrictHostKeyChecking=accept-new", "-o", "PreferredAuthentications=publickey"])
+            .args(["127.0.0.1", "true"])
+            .output()
+            .await
+            .unwrap();
+        let sshd_log = std::fs::read_to_string(agent.dir.join("sshd.log")).unwrap_or_default();
+        assert!(ssh.status.success(), "ssh: {}\nsshd: {sshd_log}", String::from_utf8_lossy(&ssh.stderr));
+
+        let host_fp = ssh_key::PublicKey::read_openssh_file(&agent.dir.join("hostkey.pub")).unwrap().fingerprint(HashAlg::Sha256).to_string();
+        let user = std::env::var("USER").unwrap();
+        assert_eq!(*agent.seen.lock().unwrap(), [("login".to_string(), Some(host_fp), Some(user))]);
+    }
+
     #[test]
     fn reader_never_panics_on_garbage() {
         for len in 0..64 {
             let junk: Vec<u8> = (0..len).map(|i| (i * 37 % 256) as u8).collect();
             let _ = session_bind(&junk);
             let _ = sshsig_namespace(&junk);
-            let _ = userauth_user(&junk, b"x");
+            let _ = classify(&junk, &Bind { session_id: b"x".to_vec(), ..Default::default() }, b"k");
             let mut rd = Reader(&junk);
             let _ = (rd.string(), rd.u32(), rd.byte());
         }

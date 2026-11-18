@@ -666,7 +666,9 @@ struct IslandView: View {
                 }
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
+                        // user@host: when it doesn't fit, cut the user, never the verified host.
                         Text(r.title).font(.system(size: 15, weight: .semibold)).lineLimit(1)
+                            .truncationMode(r.ssh?.purpose == "login" ? .head : .tail)
                         if core.queue.count > 1 {
                             Text("+\(core.queue.count - 1)")
                                 .font(.system(size: 11, weight: .bold))
