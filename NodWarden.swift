@@ -260,6 +260,28 @@ struct IslandShape: Shape {
 
 let springOpen = Animation.spring(response: 0.42, dampingFraction: 0.8)
 let springClose = Animation.spring(response: 0.34, dampingFraction: 1.0)
+/// Small content swaps (icon ↔ label, status changes): quick, no overshoot.
+let springSwap = Animation.spring(response: 0.28, dampingFraction: 0.9)
+
+/// Blurs and scales while fading, so a swap reads as one element morphing.
+struct BlurScale: ViewModifier {
+    let on: Bool
+    var scale: CGFloat = 0.8
+    var y: CGFloat = 0
+    func body(content: Content) -> some View {
+        content
+            .blur(radius: on ? 0 : 5)
+            .scaleEffect(on ? 1 : scale)
+            .opacity(on ? 1 : 0)
+            .offset(y: on ? 0 : y)
+    }
+}
+
+extension AnyTransition {
+    static func blurSwap(y: CGFloat = 0) -> AnyTransition {
+        .modifier(active: BlurScale(on: false, scale: 0.85, y: y), identity: BlurScale(on: true))
+    }
+}
 
 final class Layout: ObservableObject {
     var size: CGSize = .zero
@@ -395,7 +417,28 @@ struct IslandView: View {
             .accessibilityLabel("NodWarden, \(stateLabel)")
     }
 
+    /// Identity for the right ear's content, so each change gets its own transition.
+    var trailingKey: String {
+        switch core.outcome {
+        case .approved(let d), .auto(let d): return "ok:\(d)"
+        case .denied: return "denied"
+        case .expired: return "expired"
+        case .notFound: return "notfound"
+        case .locked: return "lockedout"
+        case nil: return core.unlocking ? "unlocking" : "state"
+        }
+    }
+
     @ViewBuilder var trailingGlyph: some View {
+        ZStack {
+            trailingContent
+                .id(trailingKey)
+                .transition(reduceMotion ? .opacity : .blurSwap(y: 4))
+        }
+        .animation(reduceMotion ? .easeOut(duration: 0.15) : springSwap, value: trailingKey)
+    }
+
+    @ViewBuilder var trailingContent: some View {
         Group {
             switch core.outcome {
             case .approved(let d): Label(short(d), systemImage: "checkmark").foregroundStyle(.green)
@@ -412,14 +455,14 @@ struct IslandView: View {
                     Image(systemName: lockSymbol)
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(stateColor)
-                        .contentTransition(.symbolEffect(.replace))
+                        .contentTransition(.symbolEffect(.replace.magic(fallback: .downUp.byLayer)))
+                        .animation(springSwap, value: lockSymbol)
                 }
             }
         }
         .font(.system(size: 12, weight: .semibold))
         .foregroundStyle(.white.opacity(0.85))
         .lineLimit(1)
-        .contentTransition(.opacity)
     }
 
     func requestView(_ r: CredRequest) -> some View {
@@ -432,8 +475,10 @@ struct IslandView: View {
                         if core.queue.count > 1 {
                             Text("+\(core.queue.count - 1)")
                                 .font(.system(size: 11, weight: .bold))
+                                .contentTransition(.numericText(value: Double(core.queue.count)))
                                 .padding(.horizontal, 6).padding(.vertical, 1)
                                 .background(.white.opacity(0.14), in: Capsule())
+                                .transition(.blurSwap())
                         }
                     }
                     Text(detailLine(r))
@@ -449,12 +494,19 @@ struct IslandView: View {
                 Button("Deny") { cancelPrompt(); core.decide(r, "deny") }.buttonStyle(Pill(.quiet))
                 Spacer(minLength: 0)
                 HStack(spacing: 0) {
-                    Button("Allow \(minutes)m") { cancelPrompt(); approve(r, minutes: minutes) }
+                    Button { cancelPrompt(); approve(r, minutes: minutes) } label: {
+                        HStack(spacing: 4) {
+                            Text("Allow")
+                            Text("\(minutes)m").contentTransition(.numericText(value: Double(minutes)))
+                        }
+                    }
                         .buttonStyle(Pill(.quiet, flat: true))
                         .accessibilityLabel("Allow for \(minutes) minutes")
                     Button {
                         let steps = [5, 10, 30, 60]
-                        minutes = steps[((steps.firstIndex(of: minutes) ?? 1) + 1) % steps.count]
+                        withAnimation(springSwap) {
+                            minutes = steps[((steps.firstIndex(of: minutes) ?? 1) + 1) % steps.count]
+                        }
                     } label: {
                         Image(systemName: "chevron.up.chevron.down").font(.system(size: 10, weight: .bold))
                     }
@@ -481,24 +533,34 @@ struct IslandView: View {
                     HStack(spacing: 6) {
                         Image(systemName: lockSymbol).font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(stateColor)
+                            .contentTransition(.symbolEffect(.replace.magic(fallback: .downUp.byLayer)))
                         Text(stateLabel).font(.system(size: 14, weight: .semibold))
+                            .contentTransition(.interpolate)
                     }
                     Text(stateDetail).font(.system(size: 12)).foregroundStyle(.white.opacity(0.6))
+                        .contentTransition(.interpolate)
                 }
                 Spacer()
             }
             HStack {
                 Spacer()
-                switch core.state {
-                case .unlocked:
-                    Button("Lock") { core.lock() }.buttonStyle(Pill(.quiet))
-                case .locked:
-                    Button(core.unlocking ? "Waiting for Touch ID…" : "Unlock with Touch ID") { core.unlock() }.buttonStyle(Pill(.primary))
-                default:
-                    EmptyView()
+                ZStack {
+                    switch core.state {
+                    case .unlocked:
+                        Button("Lock") { core.lock() }.buttonStyle(Pill(.quiet))
+                            .transition(.blurSwap(y: 6))
+                    case .locked:
+                        Button(core.unlocking ? "Waiting for Touch ID…" : "Unlock with Touch ID") { core.unlock() }
+                            .buttonStyle(Pill(.primary))
+                            .transition(.blurSwap(y: 6))
+                    default:
+                        EmptyView()
+                    }
                 }
             }
         }
+        .animation(reduceMotion ? .easeOut(duration: 0.15) : springSwap, value: core.state)
+        .animation(reduceMotion ? .easeOut(duration: 0.15) : springSwap, value: core.unlocking)
         .padding(.top, notch.height + 10)
         .padding(.bottom, 16)
         .transition(.opacity.animation(springOpen.delay(0.06)))
@@ -631,7 +693,9 @@ struct Countdown: View {
                     .animation(.linear(duration: 0.25), value: left)
                 Text("\(Int(left.rounded(.up)))")
                     .font(.system(size: 10, weight: .semibold).monospacedDigit())
-                    .foregroundStyle(.white.opacity(0.7))
+                    .foregroundStyle(left < 15 ? Color.orange : .white.opacity(0.7))
+                    .contentTransition(.numericText(countsDown: true))
+                    .animation(springSwap, value: Int(left.rounded(.up)))
             }
             .frame(width: 28, height: 28)
         }
@@ -650,21 +714,24 @@ struct AllowButton: View {
     /// After Touch ID is cancelled (`waiting` false), it's a plain "Allow" button that reopens it.
     var showText: Bool { (hover || !waiting) && !filled }
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
         Button(action: action) {
             ZStack {
                 fingerprint
-                    .opacity(showText ? 0 : 1)
-                    .scaleEffect(showText ? 0.85 : (filled ? 1.15 : 1))
+                    .modifier(BlurScale(on: !showText, scale: 0.6, y: -6))
+                    .scaleEffect(filled ? 1.15 : 1)
                 Text("Allow")
-                    .opacity(showText ? 1 : 0)
-                    .scaleEffect(showText ? 1 : 0.85)
+                    .modifier(BlurScale(on: showText, scale: 0.7, y: 6))
             }
+            // Same width for both, so the button never jumps.
             .frame(width: 44)
         }
         .buttonStyle(Pill(.primary))
         .disabled(filled)
-        .onHover { h in withAnimation(.easeOut(duration: 0.15)) { hover = h } }
+        .onHover { h in withAnimation(reduceMotion ? .easeOut(duration: 0.12) : springSwap) { hover = h } }
+        .animation(reduceMotion ? .easeOut(duration: 0.12) : springSwap, value: waiting)
         .animation(.spring(response: 0.3, dampingFraction: 0.6), value: filled)
         .help(waiting ? "Touch the sensor, or click to allow" : "Allow")
         .accessibilityLabel("Allow")
