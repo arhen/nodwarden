@@ -179,9 +179,16 @@ Don't use `aac connect --output json` for real secrets: it prints them to stdout
 
 ## Known limits
 
-- An agent running as your user can still call `bw unlock --raw` or `bwbio unlock --raw` itself.
-  That shows a bare Touch ID prompt with no NodWarden request. Never approve a Touch ID prompt
-  that NodWarden did not start.
+- **An agent running as your macOS user can ask for Touch ID itself.** It runs `bw unlock --raw`
+  or `bwbio unlock --raw`, and Bitwarden Desktop shows its usual *"unlock your vault"* prompt.
+  If you touch it, the agent gets the whole vault. NodWarden doesn't cause this and can't block it:
+  - Bitwarden Desktop accepts unlock requests from any program running as you.
+  - Its prompt always has the same text, so you can't see who asked.
+  - macOS lets programs running as the same user reach each other.
+
+  **Fix:** run agents as a separate macOS user, or in a VM or container. They can't reach your
+  Desktop app, but they can still request secrets through NodWarden. If they run as you, never
+  touch a Touch ID prompt that NodWarden didn't start.
 - Vaultwarden older than 1.37.4 can't log in with `bw` 2026.9.0+ (`KeyIdBackfillError`).
   Upgrade the server, or pin `bw` 2026.8.0.
 - Agent Access is an early preview. Its protocol may change.
@@ -216,7 +223,8 @@ but it does see connection metadata.
 It works with both bitwarden.com and Vaultwarden. 1Password isn't supported; its CLI has its own approval prompt.
 
 **Is it fully secure?**
-No. See [Known limits](#known-limits).
+No. The main gap comes from Bitwarden Desktop, not NodWarden: any program running as you can trigger
+its Touch ID unlock. Run agents as a separate macOS user to close it. See [Known limits](#known-limits).
 
 ## License
 
