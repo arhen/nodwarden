@@ -72,11 +72,20 @@ struct VLine: View {
     var height: CGFloat = 44
     var dashed = false
     var label: String? = nil
+    var color: Color? = nil
+    /// 0...1 position of a travelling dot, nil = no dot.
+    var dot: CGFloat? = nil
+    var dotColor: Color = .blue
     var body: some View {
         ZStack {
             Path { p in p.move(to: .init(x: 1, y: 0)); p.addLine(to: .init(x: 1, y: height)) }
-                .stroke(t.line, style: StrokeStyle(lineWidth: 2, dash: dashed ? [5, 5] : []))
+                .stroke(color ?? t.line, style: StrokeStyle(lineWidth: 2, dash: dashed ? [5, 5] : []))
                 .frame(width: 2, height: height)
+            if let dot {
+                Circle().fill(dotColor).frame(width: 12, height: 12)
+                    .shadow(color: dotColor.opacity(0.8), radius: 6)
+                    .offset(y: (dot - 0.5) * height)
+            }
             if let label {
                 Text(label).font(.system(size: 12, weight: .semibold)).foregroundStyle(t.sub)
                     .padding(.horizontal, 8).padding(.vertical, 2)
@@ -144,10 +153,91 @@ let amber = Color(red: 0.92, green: 0.62, blue: 0.05)
 let teal = Color(red: 0.08, green: 0.62, blue: 0.68)
 
 let island = NSImage(contentsOfFile: "assets/states/3-request.png")!
+let islandFull = [
+    "idle": NSImage(contentsOfFile: "assets/states/full/idle.png")!,
+    "request": NSImage(contentsOfFile: "assets/states/full/request.png")!,
+    "approved": NSImage(contentsOfFile: "assets/states/full/approved.png")!,
+]
+
+/// The overview story, in seconds. One loop = `Story.length`.
+enum Story {
+    static let length: Double = 9.0
+    // Phases: idle, codex asks, line to relay, relay to notch, island opens, nod, dot back down, released, settle.
+    static func phase(_ s: Double) -> (name: String, k: Double) {
+        let marks: [(String, Double)] = [
+            ("idle", 0.0), ("ask", 0.9), ("toRelay", 1.5), ("toNotch", 2.3), ("open", 3.1),
+            ("nod", 5.1), ("toVault", 5.9), ("back", 6.6), ("done", 7.6), ("end", Story.length),
+        ]
+        for i in 0..<(marks.count - 1) where s >= marks[i].1 && s < marks[i + 1].1 {
+            return (marks[i].0, (s - marks[i].1) / (marks[i + 1].1 - marks[i].1))
+        }
+        return ("done", 1)
+    }
+}
+
+func ease(_ x: Double) -> CGFloat { CGFloat(1 - pow(1 - min(max(x, 0), 1), 3)) }
 let mark: NSImage = { let i = NSImage(contentsOfFile: "assets/mark-512.png")!; i.isTemplate = true; return i }()
 
 struct Overview: View {
     let t: Theme
+    /// Seconds into the story; nil renders the static poster.
+    var time: Double? = nil
+
+    var ph: (name: String, k: Double) { time.map(Story.phase) ?? ("open", 1) }
+    func after(_ names: String...) -> Bool { names.contains(ph.name) }
+    var asking: Bool { !after("idle") }
+    var granted: Bool { after("nod", "toVault", "back", "done") }
+    var lineTint: Color { granted ? green : blue }
+
+    var codexPill: (String, PillKind) {
+        switch ph.name {
+        case "idle": return ("Idle", .plain)
+        case "done": return ("Got github.com ✓", .accent(green))
+        case "back": return ("Receiving…", .accent(green))
+        default: return ("Requesting github.com", .accent(blue))
+        }
+    }
+    var relayPill: (String, PillKind) {
+        switch ph.name {
+        case "toRelay", "toNotch": return ("Relaying (encrypted)…", .accent(blue))
+        case "back": return ("Relaying (encrypted)…", .accent(green))
+        default: return ("Sees nothing", .plain)
+        }
+    }
+    var notchState: (String, Color) {
+        switch ph.name {
+        case "idle", "ask", "toRelay", "toNotch": return ("Idle", t.sub)
+        case "open": return ("Waiting for your nod", amber)
+        case "nod": return ("Touch ID ✓", green)
+        default: return ("Released ✓", green)
+        }
+    }
+    var islandImage: NSImage {
+        guard time != nil else { return island }
+        switch ph.name {
+        case "idle", "ask", "toRelay", "toNotch": return islandFull["idle"]!
+        case "open", "nod": return islandFull["request"]!
+        default: return islandFull["approved"]!
+        }
+    }
+    /// The island grows with its content, like the real one.
+    var islandHeight: CGFloat {
+        guard time != nil else { return 160 }
+        switch ph.name {
+        case "open": return 46 + 114 * ease(ph.k * 2.5)
+        case "nod": return 160
+        case "toVault": return 160 - 114 * ease(ph.k * 1.5)
+        default: return 46
+        }
+    }
+    var vaultPill: (String, PillKind) {
+        switch ph.name {
+        case "toVault": return ("Looking up github.com…", .accent(blue))
+        case "back", "done": return ("Released 1 item ✓", .accent(green))
+        default: return ("Releases one item, not the vault", .plain)
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             Header(t: t, title: "NodWarden", subtitle: "One secret per request, released only with your nod")
@@ -157,13 +247,26 @@ struct Overview: View {
             HStack(spacing: 30) {
                 Card(t: t, icon: "sparkles", tint: violet, title: "Claude Code", subtitle: "Coding agent", pill: "Idle")
                 Card(t: t, icon: "terminal", tint: orange, title: "Codex", subtitle: "Coding agent",
-                     pill: "Requesting github.com", kind: .accent(blue))
+                     pill: codexPill.0, kind: codexPill.1)
+                    .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .strokeBorder(after("done") ? green : .clear, lineWidth: 2))
                 Card(t: t, icon: "gearshape", tint: green, title: "deploy.sh", subtitle: "Script", pill: "Idle")
             }
-            FanIn(xs: [165, 525, 885]).stroke(t.line, lineWidth: 2).frame(width: 1050, height: 54)
+            ZStack {
+                FanIn(xs: [165, 525, 885]).stroke(t.line, lineWidth: 2)
+                FanIn(xs: [525]).stroke(asking ? lineTint : .clear, lineWidth: 2)
+                if after("ask") || (after("back") && ph.k >= 0.5) {
+                    let k = after("ask") ? ease(ph.k) : 1 - ease((ph.k - 0.5) * 2)
+                    Circle().fill(lineTint).frame(width: 12, height: 12).shadow(color: lineTint.opacity(0.8), radius: 6)
+                        .position(x: 525, y: 54 * k)
+                }
+            }
+            .frame(width: 1050, height: 54)
             Card(t: t, icon: "lock", tint: teal, title: "Agent Access relay", subtitle: "End-to-end encrypted (Noise)",
-                 pill: "Sees nothing", dashed: true, width: 380)
-            VLine(t: t, height: 48, dashed: true)
+                 pill: relayPill.0, kind: relayPill.1, dashed: true, width: 380)
+            VLine(t: t, height: 48, dashed: true, color: asking && !after("ask", "toRelay") ? lineTint : nil,
+                  dot: after("toNotch") ? ease(ph.k) : (after("back") && ph.k < 0.5 ? 1 - ease(ph.k * 2) : nil),
+                  dotColor: lineTint)
             VStack(spacing: 16) {
                 HStack(spacing: 16) {
                     ZStack {
@@ -177,22 +280,37 @@ struct Overview: View {
                         Text("Grows out of your MacBook's notch").font(.system(size: 15)).foregroundStyle(t.sub)
                     }
                     Spacer()
-                    Text("Waiting for your nod").font(.system(size: 13, weight: .semibold)).foregroundStyle(amber)
-                        .padding(.horizontal, 12).padding(.vertical, 5).background(amber.opacity(0.14), in: Capsule())
+                    Text(notchState.0).font(.system(size: 13, weight: .semibold)).foregroundStyle(notchState.1)
+                        .padding(.horizontal, 12).padding(.vertical, 5).background(notchState.1.opacity(0.14), in: Capsule())
                 }
-                Image(nsImage: island).resizable().scaledToFit()
+                Image(nsImage: islandImage).resizable().scaledToFill()
+                    .frame(width: 576, height: islandHeight, alignment: .top)
+                    .clipped()
                     .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(alignment: .bottomTrailing) {
+                        if after("nod") {
+                            Image(systemName: "touchid").font(.system(size: 34, weight: .semibold))
+                                .foregroundStyle(Color(red: 0.95, green: 0.3, blue: 0.5))
+                                .padding(10).background(.black.opacity(0.6), in: Circle())
+                                .scaleEffect(0.8 + 0.2 * ease(ph.k * 2))
+                                .padding(14)
+                        }
+                    }
             }
             .padding(22)
             .frame(width: 620)
             .background(t.card, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).strokeBorder(amber.opacity(0.55), lineWidth: 1.5))
-            VLine(t: t, height: 54, label: "Touch ID")
+            .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .strokeBorder(time == nil || after("open", "nod") ? amber.opacity(0.7) : (granted ? green.opacity(0.6) : t.border),
+                              lineWidth: 1.5))
+            VLine(t: t, height: 54, label: "Touch ID", color: granted ? green : nil,
+                  dot: after("toVault") ? ease(ph.k) : nil, dotColor: green)
             Card(t: t, icon: "shield.lefthalf.filled", tint: blue, title: "Bitwarden vault",
-                 subtitle: "On your Mac", pill: "Releases one item, not the vault", width: 420)
+                 subtitle: "On your Mac", pill: vaultPill.0, kind: vaultPill.1, width: 420)
+            Spacer(minLength: 0)
         }
         .padding(.vertical, 64).padding(.horizontal, 60)
-        .frame(width: 1170)
+        .frame(width: 1170, height: 1090, alignment: .top)
         .background(t.bg)
     }
 }
@@ -273,18 +391,33 @@ struct Wordmark: View {
     }
 }
 
-@MainActor func save<V: View>(_ v: V, _ name: String) {
+@MainActor func save<V: View>(_ v: V, _ name: String, scale: CGFloat = 2) {
     let r = ImageRenderer(content: v)
-    r.scale = 2
+    r.scale = scale
     guard let img = r.nsImage, let tiff = img.tiffRepresentation,
           let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else {
         print("failed: \(name)"); return
     }
-    try! png.write(to: URL(fileURLWithPath: "assets/\(name).png"))
-    print("wrote assets/\(name).png")
+    try! png.write(to: URL(fileURLWithPath: name.hasPrefix("/") ? "\(name).png" : "assets/\(name).png"))
+    if !name.hasPrefix("/") { print("wrote assets/\(name).png") }
+}
+
+/// Frames for the animated overview; docs/animate.sh stitches them into WebP.
+@MainActor func frames(dark: Bool, fps: Double, dir: String) {
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let n = Int(Story.length * fps)
+    for i in 0..<n {
+        save(Overview(t: Theme(dark: dark), time: Double(i) / fps), String(format: "%@/f%04d", dir, i), scale: 1.5)
+    }
+    print("wrote \(n) frames to \(dir)")
 }
 
 MainActor.assumeIsolated {
+    if let i = CommandLine.arguments.firstIndex(of: "--frames") {
+        let dark = CommandLine.arguments[i + 1] == "dark"
+        frames(dark: dark, fps: 24, dir: CommandLine.arguments[i + 2])
+        return
+    }
     for dark in [true, false] {
         let t = Theme(dark: dark), s = dark ? "dark" : "light"
         save(Overview(t: t), "overview-\(s)")

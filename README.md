@@ -23,7 +23,7 @@ Agents use the standard `aac` client; NodWarden replaces the listener on your Ma
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/overview-dark.webp">
     <source media="(prefers-color-scheme: light)" srcset="assets/overview-light.webp">
-    <img alt="NodWarden overview" src="assets/overview-light.webp" width="960">
+    <img alt="Animated: an agent requests github.com, NodWarden opens in the notch, you approve with Touch ID, one credential is released" src="assets/overview-light.webp" width="960">
   </picture>
 </p>
 
@@ -186,3 +186,8 @@ Don't use `aac connect --output json` for real secrets: it prints them to stdout
 Apache-2.0. `core/src/storage/*` is copied unmodified from
 [bitwarden/agent-access](https://github.com/bitwarden/agent-access) (Apache-2.0, © Bitwarden Inc.).
 NodWarden is not affiliated with or endorsed by Bitwarden.
+
+## Docs artwork
+
+The README images are rendered from code. `swift docs/diagrams.swift` redraws the static images;
+`docs/animate.sh` redraws the animated overview (needs ImageMagick and `img2webp`).
