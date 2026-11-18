@@ -150,13 +150,19 @@ final class Core: ObservableObject {
         Bundle.main.executableURL!.deletingLastPathComponent().appendingPathComponent("aac-core").path
     }
 
-    /// stderr of aac-core: ~/Library/Logs/NodWarden/aac-core.log, created 0600, never a symlink (#16).
+    /// stderr of aac-core: ~/Library/Logs/NodWarden/aac-core.log, 0600, never a symlink (#16).
+    /// Appended to, not truncated: the core is restarted a second after it dies, and its last
+    /// words (a panic) are the reason to read this file. Started over once it passes 1 MB.
     static func openLog() -> FileHandle {
         let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/NodWarden")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let path = dir.appendingPathComponent("aac-core.log").path
-        let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0o600)
-        return fd >= 0 ? FileHandle(fileDescriptor: fd, closeOnDealloc: true) : FileHandle.nullDevice
+        let fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { return FileHandle.nullDevice }
+        fchmod(fd, 0o600)
+        var st = stat()
+        if fstat(fd, &st) == 0, st.st_size > 1 << 20 { ftruncate(fd, 0) }
+        return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     }
 
     func start() {
