@@ -33,7 +33,7 @@ struct SSHInfo: Equatable {
 
 enum VaultState: Equatable { case starting, connecting, locked, unlocked, offline(String) }
 
-enum Outcome: Equatable {
+enum Outcome: Hashable {
     case approved(String), denied(String), auto(String), expired(String), notFound(String), locked(String), cancelled(String)
 }
 
@@ -275,7 +275,7 @@ final class Core: ObservableObject {
                 id: id, title: name, detail: parts.joined(separator: "  ·  "),
                 device: e["device"] as? String ?? "unknown",
                 arrived: Date(), timeout: e["timeout"] as? Double ?? 110))
-            NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+            announceArrival()
         case "ssh_request":
             guard let id = e["id"] as? Int else { return }
             let purpose = e["purpose"] as? String ?? "unverified data"
@@ -293,7 +293,7 @@ final class Core: ObservableObject {
                 arrived: Date(), timeout: e["timeout"] as? Double ?? 110,
                 ssh: SSHInfo(key: key, purpose: purpose, app: app, via: via,
                              canRemember: e["can_allow"] as? Bool ?? false)))
-            NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+            announceArrival()
         case "resolved":
             guard let id = e["id"] as? Int else { return }
             let label = queue.first(where: { $0.id == id })?.title
@@ -313,12 +313,25 @@ final class Core: ObservableObject {
         }
     }
 
+    private let arrivalSound: NSSound? = {
+        let s = NSSound(named: "Tink")
+        s?.volume = 0.5
+        return s
+    }()
+
+    /// Haptic plus a short system sound; `NSSound.play()` is asynchronous.
+    private func announceArrival() {
+        NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+        arrivalSound?.stop()
+        arrivalSound?.play()
+    }
+
     private func flash(_ o: Outcome) {
         outcomeWork?.cancel()
         outcome = o
         let w = DispatchWorkItem { [weak self] in self?.outcome = nil }
         outcomeWork = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6, execute: w)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: w)
     }
 
     func decide(_ r: CredRequest, _ decision: String, minutes: Int? = nil) {
@@ -429,7 +442,7 @@ struct Notch {
     }
 }
 
-enum Mode: Equatable { case compact, expanded }
+enum Mode: Equatable { case compact, result, expanded }
 
 /// Notch-fused silhouette: flush top edge, small concave shoulders where it
 /// meets the bezel, large continuous corners at the bottom.
@@ -528,19 +541,21 @@ struct IslandView: View {
 
     var mode: Mode {
         if current != nil || pinned { return .expanded }
+        if core.outcome != nil { return .result }
         return .compact
     }
 
     /// Width of each "ear" flanking the notch. Always visible so the island
     /// reads as present even on a static hardware notch.
-    var ear: CGFloat {
-        if core.outcome != nil { return 96 }
-        return hovering ? 78 : 64
-    }
+    var ear: CGFloat { hovering ? 78 : 64 }
+
+    /// Height of the result row hanging below the notch.
+    let resultRow: CGFloat = 48
 
     var size: CGSize {
         switch mode {
         case .compact: return CGSize(width: max(notch.width, 120) + ear * 2, height: notch.height)
+        case .result: return CGSize(width: max(notch.width + 140, 360), height: notch.height + resultRow)
         case .expanded:
             return CGSize(width: max(notch.width + 200, 440), height: notch.height + (current != nil ? 106 : 104))
         }
@@ -549,9 +564,9 @@ struct IslandView: View {
     var body: some View {
         VStack(spacing: 0) {
             ZStack(alignment: .top) {
-                IslandShape(top: 8, bottom: mode == .expanded ? 30 : 12)
+                IslandShape(top: 8, bottom: cornerRadius)
                     .fill(.black)
-                    .shadow(color: .black.opacity(mode == .expanded ? 0.45 : 0), radius: 18, y: 8)
+                    .shadow(color: .black.opacity(shadowOpacity), radius: 18, y: 8)
 
                 content
                     .foregroundStyle(.white)
@@ -571,6 +586,7 @@ struct IslandView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .animation(reduceMotion ? .easeOut(duration: 0.18) : (mode == .compact ? springClose : springOpen), value: mode)
+        .animation(reduceMotion ? .easeOut(duration: 0.18) : springSwap, value: core.outcome)
         .animation(reduceMotion ? .easeOut(duration: 0.18) : springOpen, value: current?.id)
         .environment(\.colorScheme, .dark)
         .onAppear { layout.size = size }
@@ -610,6 +626,8 @@ struct IslandView: View {
         switch mode {
         case .compact:
             compact.frame(height: notch.height)
+        case .result:
+            if let o = core.outcome { resultView(o) }
         case .expanded:
             if let r = current { requestView(r) } else { statusView }
         }
@@ -634,18 +652,24 @@ struct IslandView: View {
             .accessibilityLabel("NodWarden, \(stateLabel)")
     }
 
-    /// Identity for the right ear's content, so each change gets its own transition.
-    var trailingKey: String {
-        switch core.outcome {
-        case .approved(let d), .auto(let d): return "ok:\(d)"
-        case .denied: return "denied"
-        case .expired: return "expired"
-        case .notFound: return "notfound"
-        case .locked: return "lockedout"
-        case .cancelled: return "cancelled"
-        case nil: return core.unlocking ? "unlocking" : "state"
+    var cornerRadius: CGFloat {
+        switch mode {
+        case .compact: return 12
+        case .result: return 20
+        case .expanded: return 30
         }
     }
+
+    var shadowOpacity: Double {
+        switch mode {
+        case .compact: return 0
+        case .result: return 0.35
+        case .expanded: return 0.45
+        }
+    }
+
+    /// Identity for the right ear's content, so each change gets its own transition.
+    var trailingKey: String { core.unlocking ? "unlocking" : "state" }
 
     @ViewBuilder var trailingGlyph: some View {
         ZStack {
@@ -657,31 +681,55 @@ struct IslandView: View {
     }
 
     @ViewBuilder var trailingContent: some View {
-        Group {
-            switch core.outcome {
-            case .approved(let d): Label(short(d), systemImage: "checkmark").foregroundStyle(.green)
-            case .auto(let d): Label(short(d), systemImage: "checkmark").foregroundStyle(.green)
-            case .denied: Label("Denied", systemImage: "xmark").foregroundStyle(.red)
-            case .expired: Label("Timed out", systemImage: "xmark").foregroundStyle(.red)
-            case .notFound: Text("No match").foregroundStyle(.orange)
-            case .locked: Text("Locked")
-            case .cancelled: Label("Cancelled", systemImage: "xmark").foregroundStyle(.secondary)
-            case nil:
-                if core.unlocking {
-                    Image(systemName: "touchid").font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.pink).symbolEffect(.pulse)
-                } else {
-                    Image(systemName: lockSymbol)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(stateColor)
-                        .modifier(SymbolSwap())
-                        .animation(springSwap, value: lockSymbol)
-                }
+        if core.unlocking {
+            Image(systemName: "touchid").font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.pink).symbolEffect(.pulse)
+        } else {
+            Image(systemName: lockSymbol)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(stateColor)
+                .modifier(SymbolSwap())
+                .animation(springSwap, value: lockSymbol)
+        }
+    }
+
+    func resultStyle(_ o: Outcome) -> (icon: String, color: Color, title: String, label: String) {
+        switch o {
+        case .approved(let d): return ("checkmark.circle.fill", .green, "Released", d)
+        case .auto(let d): return ("checkmark.circle.fill", .green, "Allowed (auto)", d)
+        case .denied(let d): return ("xmark.circle.fill", .red, "Denied", d)
+        case .expired(let d): return ("xmark.circle.fill", .red, "Timed out", d)
+        case .cancelled(let d): return ("xmark.circle.fill", .red, "Cancelled", d)
+        case .notFound(let d): return ("exclamationmark.circle.fill", .orange, "No match", d)
+        case .locked(let d): return ("exclamationmark.circle.fill", .orange, "Vault locked", d)
+        }
+    }
+
+    /// One row under the notch: icon, short verdict, then the item it concerned.
+    func resultView(_ o: Outcome) -> some View {
+        let s = resultStyle(o)
+        return HStack(spacing: 8) {
+            Image(systemName: s.icon)
+                .font(.system(size: 17, weight: .semibold))
+                .symbolRenderingMode(.palette)
+                .foregroundStyle(.white, s.color)
+            Text(s.title)
+                .font(.system(size: 14, weight: .semibold))
+                .fixedSize()
+            if !s.label.isEmpty {
+                Text(s.label)
+                    .font(.system(size: 13))
+                    .foregroundStyle(.white.opacity(0.6))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
         }
-        .font(.system(size: 12, weight: .semibold))
-        .foregroundStyle(.white.opacity(0.85))
-        .lineLimit(1)
+        .frame(maxWidth: .infinity)
+        .frame(height: resultRow - 4)
+        .padding(.top, notch.height)
+        .id(o)
+        .transition(reduceMotion ? .opacity : .blurSwap(y: -6).animation(springOpen.delay(0.04)))
+        .accessibilityElement(children: .combine)
     }
 
     func requestView(_ r: CredRequest) -> some View {
@@ -858,7 +906,6 @@ struct IslandView: View {
         }
     }
 
-    func short(_ d: String) -> String { d.count > 18 ? String(d.prefix(17)) + "…" : d }
 
     var lockSymbol: String {
         switch core.state {
@@ -1177,6 +1224,8 @@ func snapshot(to dir: String) {
     shot("4-queue") { $0.state = .unlocked; $0.queue = [sample, sample] }
     shot("5-approved") { $0.state = .unlocked; $0.outcome = .approved("github.com") }
     shot("6-denied") { $0.state = .unlocked; $0.outcome = .denied("github.com") }
+    shot("6b-notfound") { $0.state = .unlocked; $0.outcome = .notFound("staging.internal.example.com") }
+    shot("6c-auto-long") { $0.state = .unlocked; $0.outcome = .auto("accounts.very-long-subdomain.enterprise-identity-provider.example.com") }
     shot("7-locked-pinned", false, true) { $0.state = .locked }
     shot("8-unlocking") { $0.state = .locked; $0.unlocking = true }
     shot("9-offline") { $0.state = .offline("relay: connection refused") }
