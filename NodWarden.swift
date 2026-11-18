@@ -306,6 +306,7 @@ final class Core: ObservableObject {
             return
         }
         unlocking = true
+        let started = lockCount
         let candidates = [Tools.bw, Tools.bwbio].compactMap { $0 }
         DispatchQueue.global().async {
             var session: String?
@@ -314,11 +315,17 @@ final class Core: ObservableObject {
             }
             DispatchQueue.main.async {
                 self.unlocking = false
-                if let session {
-                    self.send(["op": "unlock", "session": session])
-                } else {
+                guard let session else {
                     self.log = Array((self.log + ["Touch ID unlock failed or was cancelled"]).suffix(5))
+                    return
                 }
+                guard started == self.lockCount else {
+                    // The Mac slept or locked while Bitwarden's Touch ID prompt was up. Don't unlock
+                    // behind a locked screen; lock again so the session just made stops working.
+                    self.send(["op": "lock"])
+                    return
+                }
+                self.send(["op": "unlock", "session": session])
             }
         }
     }
@@ -345,7 +352,13 @@ final class Core: ObservableObject {
         return s.count == 88 && Data(base64Encoded: s) != nil ? s : nil
     }
 
-    func lock() { send(["op": "lock"]) }
+    /// Counts locks, so an unlock that was still waiting when the Mac locked is dropped.
+    private var lockCount = 0
+
+    func lock() {
+        lockCount += 1
+        send(["op": "lock"])
+    }
 }
 
 // MARK: - Presence check
