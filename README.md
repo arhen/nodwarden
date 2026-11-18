@@ -51,7 +51,9 @@ type into that terminal can approve for you.
 - The agent asks for one item (`aac run --domain github.com …`), never the vault.
 - The notch grows open and shows the site, the username, whether a 2FA code comes with it,
   which device is asking, and a countdown.
-- **Allow** needs Touch ID. **Allow 10m** auto-approves the same device and item for a window
+- Touch ID starts as soon as the request appears: touch the sensor to allow. The fingerprint fills red
+  as it's released. Cancel the prompt and the request stays open; click **Allow** to bring Touch ID
+  back. **Allow 10m** auto-approves the same device and item for a window
   you choose (5–60 min). **Deny**, or no answer within 110 s, refuses the request.
 - The secret goes into the environment of the agent's child process only. It never reaches
   stdout, so it stays out of the model's context.

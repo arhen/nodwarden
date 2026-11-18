@@ -197,12 +197,15 @@ final class Core: ObservableObject {
 
 /// Approving with a click alone could be forged by anything with Accessibility
 /// access. Device-owner auth means the release needs a finger, not a mouse event.
-func confirmPresence(_ reason: String, _ done: @escaping (Bool) -> Void) {
+/// Returns the context so the caller can cancel a pending prompt (Deny, Allow 10m, timeout).
+@discardableResult
+func confirmPresence(_ reason: String, _ done: @escaping (Bool) -> Void) -> LAContext {
     let ctx = LAContext()
     ctx.localizedFallbackTitle = ""
     ctx.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { ok, _ in
         DispatchQueue.main.async { done(ok) }
     }
+    return ctx
 }
 
 // MARK: - Geometry
@@ -271,14 +274,20 @@ struct IslandView: View {
     @State private var pinned: Bool
     @State private var minutes = 10
     @State private var confirming = false
+    /// The Touch ID prompt for the request on screen, started as soon as it arrives.
+    @State private var prompt: (id: Int, ctx: LAContext)?
+    /// Request whose Touch ID just succeeded; drives the red fill.
+    @State private var granted: Int?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let notch = Notch.current
 
-    init(core: Core, layout: Layout, hoveringInitial: Bool = false, pinnedInitial: Bool = false) {
+    init(core: Core, layout: Layout, hoveringInitial: Bool = false, pinnedInitial: Bool = false, grantedInitial: Int? = nil, confirmingInitial: Bool = false) {
         self.core = core
         self.layout = layout
         _hovering = State(initialValue: hoveringInitial)
         _pinned = State(initialValue: pinnedInitial)
+        _granted = State(initialValue: grantedInitial)
+        _confirming = State(initialValue: confirmingInitial)
     }
 
     var current: CredRequest? { core.queue.first }
@@ -336,6 +345,17 @@ struct IslandView: View {
         .onChange(of: layout.dismissTick) { _, _ in
             if pinned { withAnimation(springClose) { pinned = false } }
         }
+        .onChange(of: current?.id) { _, id in
+            cancelPrompt()
+            if let id, let r = core.queue.first(where: { $0.id == id }) { approve(r, minutes: nil) }
+        }
+    }
+
+    func cancelPrompt() {
+        prompt?.ctx.invalidate()
+        prompt = nil
+        confirming = false
+        granted = nil
     }
 
     /// Status panel folds back once the pointer has been away for a moment.
@@ -426,10 +446,10 @@ struct IslandView: View {
             }
 
             HStack(spacing: 8) {
-                Button("Deny") { core.decide(r, "deny") }.buttonStyle(Pill(.quiet))
+                Button("Deny") { cancelPrompt(); core.decide(r, "deny") }.buttonStyle(Pill(.quiet))
                 Spacer(minLength: 0)
                 HStack(spacing: 0) {
-                    Button("Allow \(minutes)m") { approve(r, minutes: minutes) }
+                    Button("Allow \(minutes)m") { cancelPrompt(); approve(r, minutes: minutes) }
                         .buttonStyle(Pill(.quiet, flat: true))
                         .accessibilityLabel("Allow for \(minutes) minutes")
                     Button {
@@ -442,7 +462,7 @@ struct IslandView: View {
                     .accessibilityLabel("Change auto-allow duration")
                 }
                 .background(.white.opacity(0.14), in: Capsule())
-                Button(confirming ? "Touch ID…" : "Allow") { approve(r, minutes: nil) }.buttonStyle(Pill(.primary))
+                AllowButton(waiting: confirming, filled: granted == r.id) { approve(r, minutes: nil) }
             }
         }
         .padding(.top, notch.height + 10)
@@ -488,11 +508,26 @@ struct IslandView: View {
         guard !confirming else { return }
         confirming = true
         let what = m.map { "allow \(r.domain) for \(r.device) for \($0) minutes" } ?? "release \(r.domain) to \(r.device)"
-        confirmPresence(what) { ok in
+        let ctx = confirmPresence(what) { ok in
+            // Ignore a stale answer: the request was decided or replaced meanwhile.
+            guard prompt?.id == r.id else { return }
+            prompt = nil
             confirming = false
-            guard ok else { return }
-            if let m { minutes = m; core.decide(r, "approve_for", minutes: m) } else { core.decide(r, "approve") }
+            guard ok, core.queue.contains(where: { $0.id == r.id }) else { return }
+            if let m {
+                minutes = m
+                core.decide(r, "approve_for", minutes: m)
+                return
+            }
+            // Let the red fill finish, then release.
+            granted = r.id
+            NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+                guard core.queue.contains(where: { $0.id == r.id }) else { return }
+                core.decide(r, "approve")
+            }
         }
+        prompt = (r.id, ctx)
     }
 
     func detailLine(_ r: CredRequest) -> String {
@@ -603,6 +638,58 @@ struct Countdown: View {
     }
 }
 
+/// Fingerprint at rest (touching the sensor is the approval); "Allow" on hover for clicking.
+/// On success the print fills red from the bottom before the secret is released.
+/// macOS reports only the result of Touch ID, not finger-down, so the fill plays on success.
+struct AllowButton: View {
+    let waiting: Bool
+    let filled: Bool
+    let action: () -> Void
+    @State private var hover = false
+
+    /// After Touch ID is cancelled (`waiting` false), it's a plain "Allow" button that reopens it.
+    var showText: Bool { (hover || !waiting) && !filled }
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                fingerprint
+                    .opacity(showText ? 0 : 1)
+                    .scaleEffect(showText ? 0.85 : (filled ? 1.15 : 1))
+                Text("Allow")
+                    .opacity(showText ? 1 : 0)
+                    .scaleEffect(showText ? 1 : 0.85)
+            }
+            .frame(width: 44)
+        }
+        .buttonStyle(Pill(.primary))
+        .disabled(filled)
+        .onHover { h in withAnimation(.easeOut(duration: 0.15)) { hover = h } }
+        .animation(.spring(response: 0.3, dampingFraction: 0.6), value: filled)
+        .help(waiting ? "Touch the sensor, or click to allow" : "Allow")
+        .accessibilityLabel("Allow")
+    }
+
+    var glyph: some View {
+        Image(systemName: "touchid").font(.system(size: 17, weight: .semibold))
+    }
+
+    var fingerprint: some View {
+        glyph
+            .symbolEffect(.pulse, isActive: waiting && !hover && !filled)
+            .overlay {
+                GeometryReader { g in
+                    Rectangle()
+                        .fill(Color(red: 1, green: 0.23, blue: 0.3))
+                        .frame(height: g.size.height * (filled ? 1 : 0))
+                        .frame(maxHeight: .infinity, alignment: .bottom)
+                        .animation(.easeOut(duration: 0.4), value: filled)
+                }
+                .mask(glyph)
+            }
+    }
+}
+
 struct Pill: ButtonStyle {
     enum Kind { case primary, quiet }
     let kind: Kind
@@ -698,10 +785,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 func snapshot(to dir: String) {
     let sample = CredRequest(id: 1, domain: "github.com", username: "octocat", device: "a1b2c3d4e5f6",
                              hasTotp: true, byId: true, arrived: Date(), timeout: 110)
-    func shot(_ name: String, _ hover: Bool = false, _ pinned: Bool = false, _ setup: (Core) -> Void) {
+    func shot(_ name: String, _ hover: Bool = false, _ pinned: Bool = false, granted: Int? = nil, waiting: Bool = false, _ setup: (Core) -> Void) {
         let core = Core()
         setup(core)
-        let v = IslandView(core: core, layout: Layout(), hoveringInitial: hover, pinnedInitial: pinned)
+        let v = IslandView(core: core, layout: Layout(), hoveringInitial: hover, pinnedInitial: pinned, grantedInitial: granted, confirmingInitial: waiting)
             .frame(width: 640, height: 190)
             .background(LinearGradient(colors: [Color(red: 0.16, green: 0.20, blue: 0.32), Color(red: 0.08, green: 0.09, blue: 0.14)],
                                        startPoint: .top, endPoint: .bottom))
@@ -714,7 +801,9 @@ func snapshot(to dir: String) {
     shot("1-idle") { $0.state = .unlocked }
     shot("1b-idle-locked") { $0.state = .locked }
     shot("2-hover", true) { $0.state = .unlocked }
-    shot("3-request") { $0.state = .unlocked; $0.queue = [sample] }
+    shot("3-request", waiting: true) { $0.state = .unlocked; $0.queue = [sample] }
+    shot("3a-cancelled") { $0.state = .unlocked; $0.queue = [sample] }
+    shot("3b-touched", granted: 1, waiting: true) { $0.state = .unlocked; $0.queue = [sample] }
     shot("4-queue") { $0.state = .unlocked; $0.queue = [sample, sample] }
     shot("5-approved") { $0.state = .unlocked; $0.outcome = .approved("github.com") }
     shot("6-denied") { $0.state = .unlocked; $0.outcome = .denied("github.com") }
