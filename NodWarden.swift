@@ -493,6 +493,12 @@ struct IslandView: View {
     /// When the request on screen was shown; Allow is ignored for a moment after a queue
     /// advance so one touch can't approve the next request by accident (#14).
     @State private var shownAt = Date.distantPast
+    /// When the island last stopped showing a request. One that arrives right after waits
+    /// for a click like a queued one: a requester that sends the next request the moment
+    /// the first is answered (an SSH signature returns at once) must not find Touch ID
+    /// armed again while your finger is still on the sensor (#14).
+    @State private var clearedAt = Date.distantPast
+    static let rearmDelay: TimeInterval = 2
     /// Request whose Touch ID just succeeded; drives the red fill.
     @State private var granted: Int?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -564,9 +570,14 @@ struct IslandView: View {
         .onChange(of: current?.id) { old, id in
             cancelPrompt()
             shownAt = Date()
-            // Arm Touch ID by itself only when the island was empty. After a queue advance the
-            // next request waits for a click, so two touches can't release two things (#14).
-            if old == nil, let id, let r = core.queue.first(where: { $0.id == id }) { approve(r, minutes: nil) }
+            if old != nil, id == nil { clearedAt = Date() }
+            // Arm Touch ID by itself only when the island has been empty for a moment. After a
+            // queue advance the next request waits for a click, so two touches can't release
+            // two things (#14).
+            if old == nil, let id, Date().timeIntervalSince(clearedAt) > Self.rearmDelay,
+               let r = core.queue.first(where: { $0.id == id }) {
+                approve(r, minutes: nil, auto: true)
+            }
         }
     }
 
@@ -792,10 +803,11 @@ struct IslandView: View {
         .transition(.opacity.animation(springOpen.delay(0.06)))
     }
 
-    func approve(_ r: CredRequest, minutes m: Int?) {
+    /// `auto` is the prompt that starts by itself when a request appears; anything else is a click.
+    func approve(_ r: CredRequest, minutes m: Int?, auto: Bool = false) {
         guard !confirming else { return }
-        // A click right after the queue advanced belonged to the previous request (#14).
-        guard Date().timeIntervalSince(shownAt) > 0.6 || prompt == nil && core.queue.count == 1 else { return }
+        // A click right after the request changed was meant for the previous one (#14).
+        guard auto || Date().timeIntervalSince(shownAt) > 0.6 else { return }
         confirming = true
         let what: String
         if let s = r.ssh {
