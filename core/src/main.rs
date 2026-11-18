@@ -185,20 +185,32 @@ fn device_label(conns: &[ap_client::ConnectionInfo], id: &IdentityFingerprint) -
         .unwrap_or_else(|| hex::encode(id.0).chars().take(12).collect())
 }
 
-/// Makes the identity key and its directory private (#26: upstream writes them 0644).
-fn tighten_access_protocol_perms() {
+/// Makes the identity key, the other pairing files and their directory private (#26: upstream
+/// writes them 0644). Only files: 0600 on a directory would make it unusable.
+fn tighten_perms(dir: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
-    let Some(dir) = dirs::home_dir().map(|h| h.join(".access-protocol")) else { return };
-    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    if let Ok(entries) = std::fs::read_dir(&dir) {
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
-            let _ = std::fs::set_permissions(e.path(), std::fs::Permissions::from_mode(0o600));
+            if e.file_type().is_ok_and(|t| t.is_file()) {
+                let _ = std::fs::set_permissions(e.path(), std::fs::Permissions::from_mode(0o600));
+            }
         }
+    }
+}
+
+fn tighten_access_protocol_perms() {
+    if let Some(home) = dirs::home_dir() {
+        tighten_perms(&home.join(".access-protocol"));
     }
 }
 
 #[tokio::main]
 async fn main() {
+    // Whatever this process and `bw` create (pairing files, the agent socket) is private from
+    // the moment it exists, not only after a chmod.
+    unsafe { libc::umask(0o077) };
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -651,6 +663,27 @@ mod tests {
         assert_eq!(host_of("https://a.com/x@b").as_deref(), Some("a.com"));
         assert_eq!(host_of("a.com").as_deref(), Some("a.com"));
         assert_eq!(host_of("https://"), None);
+    }
+
+    #[test]
+    fn pairing_files_are_made_private_and_directories_stay_usable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("nw-perms-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("user_client.key"), "seed").unwrap();
+        std::fs::write(dir.join("sub/file"), "x").unwrap();
+        let chmod = |p: &std::path::Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        chmod(&dir, 0o755);
+        chmod(&dir.join("sub"), 0o755);
+        chmod(&dir.join("user_client.key"), 0o644);
+        tighten_perms(&dir);
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join("user_client.key")), 0o600);
+        assert_eq!(mode(&dir.join("sub")), 0o755);
+        assert!(std::fs::read(dir.join("sub/file")).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
