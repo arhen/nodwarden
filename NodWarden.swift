@@ -314,8 +314,8 @@ final class Core: ObservableObject {
     }
 
     private let arrivalSound: NSSound? = {
-        let s = NSSound(named: "Tink")
-        s?.volume = 0.5
+        let s = NSSound(named: "Funk")
+        s?.volume = 1.0
         return s
     }()
 

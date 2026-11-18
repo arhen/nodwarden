@@ -563,7 +563,8 @@ fn known_host_for(fp: &str) -> Option<String> {
     for line in text.lines() {
         let mut parts = line.split_whitespace();
         let (Some(hosts), Some(kt), Some(kb)) = (parts.next(), parts.next(), parts.next()) else { continue };
-        if hosts.starts_with('|') || hosts.starts_with('@') {
+        // Skip hashed entries, markers (@cert-authority, @revoked) and commented-out lines.
+        if hosts.starts_with('|') || hosts.starts_with('@') || hosts.starts_with('#') {
             continue;
         }
         let Ok(pk) = ssh_key::PublicKey::from_openssh(&format!("{kt} {kb}")) else { continue };
