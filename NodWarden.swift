@@ -32,49 +32,92 @@ enum Outcome: Equatable {
     case approved(String), denied(String), auto(String), expired(String), notFound(String), locked(String), cancelled(String)
 }
 
-/// Absolute tool paths, resolved once (#4). PATH is only used to find them; anything in a
-/// directory other users can write is refused. Override the search with NODWARDEN_PATH.
+/// Absolute tool paths, resolved once (#4). PATH is only used to find them; a path another
+/// user could redirect is refused. Override the search with NODWARDEN_PATH.
+/// Same rules as `resolve_trusted` in core/src/bw.rs.
 enum Tools {
     static let searchPath: [String] = (ProcessInfo.processInfo.environment["NODWARDEN_PATH"] ?? [
         "\(NSHomeDirectory())/.n/bin", "\(NSHomeDirectory())/.volta/bin", "\(NSHomeDirectory())/.local/bin",
         "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
     ].joined(separator: ":")).split(separator: ":").map(String.init)
 
-    static func find(_ name: String) -> String? {
+    /// Where the tool was found, and the real file behind every symlink
+    /// (e.g. ~/.n/bin/bw -> ../lib/.../bw.js).
+    struct Tool {
+        let found: String
+        let real: String
+    }
+
+    static func find(_ name: String) -> Tool? {
         for dir in searchPath {
             let p = "\(dir)/\(name)"
             guard FileManager.default.isExecutableFile(atPath: p) else { continue }
-            // Follow every symlink to the real file (e.g. ~/.n/bin/bw -> ../lib/.../bw.js).
-            let real = URL(fileURLWithPath: p).resolvingSymlinksInPath().path
-            guard FileManager.default.fileExists(atPath: real) else { return nil }
-            return sharedWritable(real) ? nil : real
+            return resolveTrusted(p).map { Tool(found: p, real: $0) }
         }
         return nil
     }
 
-    /// True if the file or any parent directory is writable by group or others (sticky dirs excepted).
-    static func sharedWritable(_ path: String) -> Bool {
-        var url = URL(fileURLWithPath: path)
-        while url.path != "/" {
-            if let a = try? FileManager.default.attributesOfItem(atPath: url.path),
-               let mode = (a[.posixPermissions] as? NSNumber)?.intValue,
-               mode & 0o022 != 0, mode & 0o1000 == 0 {
-                return true
-            }
-            url.deleteLastPathComponent()
-        }
-        return false
+    /// Whether nobody but root, us and administrators can change this file or directory.
+    /// Group `admin` (80) may write: its members can already use sudo, and Homebrew's
+    /// directories are 775 user:admin. Sticky directories (/tmp) may be passed through.
+    static func trusted(_ st: stat) -> Bool {
+        guard st.st_uid == 0 || st.st_uid == getuid() else { return false }
+        let sticky = st.st_mode & S_IFMT == S_IFDIR && st.st_mode & S_ISVTX != 0
+        let groupWritable = st.st_mode & S_IWGRP != 0 && st.st_gid != 80
+        return sticky || !(groupWritable || st.st_mode & S_IWOTH != 0)
     }
 
-    static let node = find("node")
-    static let bw = find("bw")
-    static let bwbio = find("bwbio")
+    /// realpath(3) that returns nil if another user could redirect the result: every directory
+    /// walked through (including the ones holding a symlink on the way) and the file must be trusted.
+    static func resolveTrusted(_ path: String) -> String? {
+        let parts = { (p: String) in Array(p.split(separator: "/").map(String.init).reversed()) }
+        var todo = parts(path)
+        var cur = "/", links = 0, st = stat()
+        guard path.hasPrefix("/"), lstat(cur, &st) == 0, trusted(st) else { return nil }
+        while let name = todo.popLast() {
+            if name == "." { continue }
+            if name == ".." {
+                cur = (cur as NSString).deletingLastPathComponent
+                continue
+            }
+            let next = cur == "/" ? "/\(name)" : "\(cur)/\(name)"
+            var s = stat()
+            guard lstat(next, &s) == 0 else { return nil }
+            if s.st_mode & S_IFMT == S_IFLNK {
+                links += 1
+                guard links <= 40, let target = try? FileManager.default.destinationOfSymbolicLink(atPath: next) else { return nil }
+                if target.hasPrefix("/") { cur = "/" }
+                todo.append(contentsOf: parts(target))
+                continue
+            }
+            guard trusted(s) else { return nil }
+            cur = next
+            st = s
+        }
+        return st.st_mode & S_IFMT == S_IFREG ? cur : nil
+    }
 
-    /// PATH handed to aac-core: only the directories the resolved tools live in.
+    static let nodeTool = find("node")
+    static let bwTool = find("bw")
+    static let node = nodeTool?.real
+    static let bw = bwTool?.real
+    static let bwbio = find("bwbio")?.real
+
+    /// PATH handed to child processes: only the directories the tools were found in.
     static var childPath: String {
-        let dirs = [node, bw].compactMap { $0.map { URL(fileURLWithPath: $0).deletingLastPathComponent().path } }
+        let dirs = [nodeTool, bwTool].compactMap { $0 }.flatMap { [$0.found, $0.real] }
+            .map { URL(fileURLWithPath: $0).deletingLastPathComponent().path }
         var seen = Set<String>()
         return (dirs + ["/usr/bin", "/bin"]).filter { seen.insert($0).inserted }.joined(separator: ":")
+    }
+
+    /// Environment for aac-core. It takes `node` and `bw` by absolute path: the real `bw.js`
+    /// is usually in a directory that has no file called `bw`, so PATH can't find it.
+    static var coreEnvironment: [String: String] {
+        var env = ["PATH": childPath, "HOME": NSHomeDirectory()]
+        env["NODWARDEN_NODE"] = node
+        env["NODWARDEN_BW"] = bw
+        return env
     }
 }
 
@@ -110,7 +153,7 @@ final class Core: ObservableObject {
     func start() {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: corePath)
-        p.environment = ["PATH": Tools.childPath, "HOME": NSHomeDirectory()]
+        p.environment = Tools.coreEnvironment
         let inPipe = Pipe(), outPipe = Pipe()
         p.standardInput = inPipe
         p.standardOutput = outPipe
@@ -1070,6 +1113,14 @@ enum Main {
     static func main() {
         if let i = CommandLine.arguments.firstIndex(of: "--snapshot"), i + 1 < CommandLine.arguments.count {
             MainActor.assumeIsolated { snapshot(to: CommandLine.arguments[i + 1]) }
+            return
+        }
+        // `nodwarden --tools`: which node/bw/bwbio would be run, to diagnose a refused path.
+        if CommandLine.arguments.contains("--tools") {
+            for (name, path) in [("node", Tools.node), ("bw", Tools.bw), ("bwbio", Tools.bwbio)] {
+                print("\(name): \(path ?? "not found, or in a location another user can change")")
+            }
+            print("PATH for children: \(Tools.childPath)")
             return
         }
         let app = NSApplication.shared
