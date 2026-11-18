@@ -175,7 +175,11 @@ fn host_of(uri: &str) -> Option<String> {
     let rest = uri.split_once("://").map_or(uri, |(_, r)| r);
     let authority = rest.split(['/', '?', '#']).next()?;
     let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    let host = hostport.split(':').next()?;
+    let host = match hostport.strip_prefix('[') {
+        // IPv6 literal: the colons inside the brackets are not the port separator.
+        Some(v6) => v6.split(']').next()?,
+        None => hostport.split(':').next()?,
+    };
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
@@ -670,6 +674,8 @@ mod tests {
         assert_eq!(host_of("https://a.com/x@b").as_deref(), Some("a.com"));
         assert_eq!(host_of("a.com").as_deref(), Some("a.com"));
         assert_eq!(host_of("https://"), None);
+        assert_eq!(host_of("https://[::1]:8443/x").as_deref(), Some("::1"));
+        assert_eq!(host_of("http://[fe80::1]").as_deref(), Some("fe80::1"));
     }
 
     #[test]

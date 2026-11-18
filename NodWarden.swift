@@ -214,8 +214,12 @@ final class Core: ObservableObject {
         lock.executableURL = URL(fileURLWithPath: node)
         lock.arguments = [bw, "lock"]
         lock.environment = ["HOME": NSHomeDirectory()]
-        try? lock.run()
+        guard (try? lock.run()) != nil else { return }
+        // Quitting must not hang on a bw that does.
+        let killer = DispatchWorkItem { if lock.isRunning { lock.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 5, execute: killer)
         lock.waitUntilExit()
+        killer.cancel()
     }
 
     private func send(_ obj: [String: Any]) {
