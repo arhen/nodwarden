@@ -50,6 +50,9 @@ const SSH2_MSG_USERAUTH_REQUEST: u8 = 50;
 const MAX_MSG: usize = 256 * 1024;
 /// Waiting sign requests per connecting program before new ones are refused (#14).
 const MAX_WAITING_PER_PEER: usize = 2;
+/// Waiting sign requests in total. A program that forks gets a new pid each time, so the
+/// per-program limit alone would let it fill the notch with prompts.
+const MAX_WAITING: usize = 8;
 
 pub struct Key {
     pub name: String,
@@ -133,6 +136,26 @@ impl State {
         self.keys.clear();
         self.allowed.clear();
     }
+
+    /// Takes a place in the queue for the user, unless this program or everyone together
+    /// already has too many waiting.
+    fn start_waiting(&mut self, pid: i32) -> bool {
+        let mine = self.waiting.get(&pid).copied().unwrap_or(0);
+        if mine >= MAX_WAITING_PER_PEER || self.waiting.values().sum::<usize>() >= MAX_WAITING {
+            return false;
+        }
+        self.waiting.insert(pid, mine + 1);
+        true
+    }
+
+    fn stop_waiting(&mut self, pid: i32) {
+        if let std::collections::hash_map::Entry::Occupied(mut n) = self.waiting.entry(pid) {
+            *n.get_mut() -= 1;
+            if *n.get() == 0 {
+                n.remove();
+            }
+        }
+    }
 }
 
 pub type Shared = Arc<Mutex<State>>;
@@ -199,7 +222,11 @@ async fn serve_at(path: PathBuf, state: Shared, asks: mpsc::Sender<SignAsk>) -> 
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| format!("chmod socket: {e}"))?;
     let uid = unsafe { libc::getuid() };
     loop {
-        let Ok((stream, _)) = listener.accept().await else { continue };
+        let Ok((stream, _)) = listener.accept().await else {
+            // Out of file descriptors, most likely. Wait for some to close; don't spin.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
         if peer_uid(&stream) != Some(uid) {
             continue;
         }
@@ -271,7 +298,10 @@ async fn handle(mut s: UnixStream, state: Shared, asks: mpsc::Sender<SignAsk>) -
             SSH2_AGENTC_REQUEST_IDENTITIES => identities(&state).await,
             SSH2_AGENTC_SIGN_REQUEST => sign(&mut s, &msg[1..], &state, &asks, pid, &bind).await,
             SSH_AGENTC_EXTENSION => {
-                let bound = session_bind(&msg[1..]).is_some_and(|b| bind.add(b));
+                // Signature check and known_hosts read: keep them off the async threads (#13).
+                let body = msg[1..].to_vec();
+                let verified = tokio::task::spawn_blocking(move || session_bind(&body)).await.ok().flatten();
+                let bound = verified.is_some_and(|b| bind.add(b));
                 vec![if bound { SSH_AGENT_SUCCESS } else { SSH_AGENT_FAILURE }]
             }
             _ => vec![SSH_AGENT_FAILURE],
@@ -399,14 +429,10 @@ async fn sign(
         None => false,
     };
 
+    // A request that an Allow window covers never waits for the user, so it takes no place.
     let wait_key = pid.unwrap_or(0);
-    {
-        let mut st = state.lock().await;
-        let w = st.waiting.entry(wait_key).or_default();
-        if !auto && *w >= MAX_WAITING_PER_PEER {
-            return vec![SSH_AGENT_FAILURE];
-        }
-        *w += 1;
+    if !auto && !state.lock().await.start_waiting(wait_key) {
+        return vec![SSH_AGENT_FAILURE];
     }
     let (tx, rx) = oneshot::channel();
     let ask = SignAsk { key_name, fingerprint, host, user, purpose, peer, chain, via: bind.via.clone(), auto, reply: tx };
@@ -419,11 +445,8 @@ async fn sign(
             _ = peer_closed(sock) => false,
         }
     };
-    {
-        let mut st = state.lock().await;
-        if let Some(w) = st.waiting.get_mut(&wait_key) {
-            *w = w.saturating_sub(1);
-        }
+    if !auto {
+        state.lock().await.stop_waiting(wait_key);
     }
     if !approved {
         return vec![SSH_AGENT_FAILURE];
@@ -448,21 +471,20 @@ async fn peer_closed(sock: &UnixStream) {
         if sock.readable().await.is_err() {
             return;
         }
-        let mut b = [0u8; 1];
-        let n = unsafe { libc::recv(sock.as_raw_fd(), b.as_mut_ptr() as *mut libc::c_void, 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
-        match n {
-            0 => return,
-            n if n > 0 => {
-                // The client sent something while waiting; not a close. Don't spin on it.
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-            _ => {
-                let e = std::io::Error::last_os_error();
-                if e.kind() != std::io::ErrorKind::WouldBlock {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+        // Through `try_io`, so a peek that would block clears tokio's readiness and the next
+        // `readable()` really waits instead of returning at once.
+        let peek = sock.try_io(tokio::io::Interest::READABLE, || {
+            let mut b = [0u8; 1];
+            let n = unsafe { libc::recv(sock.as_raw_fd(), b.as_mut_ptr() as *mut libc::c_void, 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+            if n < 0 { Err(std::io::Error::last_os_error()) } else { Ok(n) }
+        });
+        match peek {
+            Ok(0) => return,
+            // The client sent something while waiting; not a close. The socket stays readable
+            // until that is read, so look again later instead of spinning.
+            Ok(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => return,
         }
     }
 }
@@ -985,6 +1007,42 @@ mod tests {
         let host_fp = ssh_key::PublicKey::read_openssh_file(&agent.dir.join("hostkey.pub")).unwrap().fingerprint(HashAlg::Sha256).to_string();
         let user = std::env::var("USER").unwrap();
         assert_eq!(*agent.seen.lock().unwrap(), [("login".to_string(), Some(host_fp), Some(user))]);
+    }
+
+    #[tokio::test]
+    async fn peer_closed_waits_for_a_real_close() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        // Open and silent: still waiting.
+        assert!(tokio::time::timeout(Duration::from_millis(150), peer_closed(&ours)).await.is_err());
+        // Data that nobody reads is not a close either.
+        theirs.try_write(b"x").unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(150), peer_closed(&ours)).await.is_err());
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        drop(theirs);
+        assert!(tokio::time::timeout(Duration::from_secs(2), peer_closed(&ours)).await.is_ok());
+    }
+
+    #[test]
+    fn waiting_requests_are_limited_per_program_and_in_total() {
+        let mut st = State::default();
+        for _ in 0..MAX_WAITING_PER_PEER {
+            assert!(st.start_waiting(100));
+        }
+        assert!(!st.start_waiting(100), "one program over its limit");
+        // A program that forks to get new pids still runs into the total.
+        let mut pid = 200;
+        while st.waiting.values().sum::<usize>() < MAX_WAITING {
+            assert!(st.start_waiting(pid));
+            pid += 1;
+        }
+        assert!(!st.start_waiting(pid));
+        // Finished requests free their place, and leave nothing behind.
+        st.stop_waiting(100);
+        assert!(st.start_waiting(pid));
+        for p in std::iter::repeat_n(100, MAX_WAITING_PER_PEER).chain(200..=pid) {
+            st.stop_waiting(p);
+        }
+        assert!(st.waiting.is_empty(), "{:?}", st.waiting);
     }
 
     #[test]
