@@ -120,7 +120,7 @@ flowchart LR
         N -- "stdin: decisions, session" --> C
         C -- "stdout: request metadata only" --> N
         C -- "BW_SESSION in child env only" --> BW
-        N -- "bwbio (once per login)" --> D
+        N -- "Touch ID unlock (bw or bwbio)" --> D
     end
     AAC <-- "E2E Noise tunnel via relay" --> C
 ```
@@ -146,7 +146,12 @@ same commit as `aac` 0.11.0. It uses the same `~/.access-protocol` pairing files
 - macOS 14+, Apple silicon. Without a notch, NodWarden hangs from the menu bar as a pill.
 - [Bitwarden CLI](https://bitwarden.com/help/cli/) (`bw`), logged in.
 - [Bitwarden Desktop](https://bitwarden.com/download/) with Touch ID unlock enabled.
-- [`bwbio`](https://github.com/jeanregisser/bitwarden-cli-bio) **≥ 1.4.3**.
+- For Touch ID unlock, **one** of:
+  - `bw` **≥ 2026.10.0** with the server flag `biometrics-sdk-ipc` on. On Vaultwarden ≥ 1.37.5, set
+    `EXPERIMENTAL_CLIENT_FEATURE_FLAGS=biometrics-sdk-ipc`. On bitwarden.com, it's on once Bitwarden enables it.
+  - [`bwbio`](https://github.com/jeanregisser/bitwarden-cli-bio) **≥ 1.4.3**, which works with any server.
+
+  NodWarden tries official `bw` first, then `bwbio`.
 - [`aac`](https://github.com/bitwarden/agent-access) 0.11.0 on the agent side, paired with a reusable PSK.
 - Rust and Xcode command line tools to build.
 
@@ -174,18 +179,19 @@ Don't use `aac connect --output json` for real secrets: it prints them to stdout
 
 ## Known limits
 
-- An agent running as your user can still call `bwbio unlock --raw` itself. That shows
-  a bare Touch ID prompt with no NodWarden request. Never approve a Touch ID prompt that
-  NodWarden did not start.
+- An agent running as your user can still call `bw unlock --raw` or `bwbio unlock --raw` itself.
+  That shows a bare Touch ID prompt with no NodWarden request. Never approve a Touch ID prompt
+  that NodWarden did not start.
 - Vaultwarden older than 1.37.4 can't log in with `bw` 2026.9.0+ (`KeyIdBackfillError`).
   Upgrade the server, or pin `bw` 2026.8.0.
 - Agent Access is an early preview. Its protocol may change.
 
 ## FAQ
 
-**Why `bwbio`?**
-The `bw` CLI can't use Touch ID on its own. `bwbio` gets a session from Bitwarden Desktop's Touch ID unlock.
-Without it, you type your master password once per login. It can go once official `bw` Touch ID works with your server.
+**Do I need `bwbio`?**
+Only if official `bw` Touch ID isn't available to you. It needs `bw` 2026.10.0+ and the server flag
+`biometrics-sdk-ipc`. NodWarden tries official `bw` first and uses `bwbio` only as a fallback.
+With neither, NodWarden cannot unlock the vault.
 
 **Why not just use `aac listen` and put a GUI on top?**
 `aac listen` is a terminal program: you approve by pressing `y`. Any process running as you, including the agent,

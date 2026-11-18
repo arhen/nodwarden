@@ -155,30 +155,39 @@ final class Core: ObservableObject {
         send(obj)
     }
 
-    /// Touch ID via the Bitwarden desktop app (bwbio). The session goes straight
-    /// into the listener's stdin; it never touches argv, env, or disk here.
+    /// Touch ID via Bitwarden Desktop. Tries the official `bw unlock` first (bw >= 2026.10
+    /// with the server's `biometrics-sdk-ipc` flag on), then `bwbio`. The session goes
+    /// straight into the listener's stdin; it never touches argv, env, or disk here.
     func unlock() {
         guard !unlocking else { return }
         unlocking = true
         DispatchQueue.global().async {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            p.arguments = ["bwbio", "unlock", "--raw"]
-            p.environment = ["PATH": toolPath,
-                             "HOME": NSHomeDirectory(), "BW_QUIET": "false"]
-            let out = Pipe()
-            p.standardOutput = out
-            p.standardError = FileHandle.nullDevice
-            try? p.run()
-            let data = out.fileHandleForReading.readDataToEndOfFile()
-            p.waitUntilExit()
-            let session = String(data: data, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let session = Core.touchIDSession(["bw", "unlock", "--raw"])
+                ?? Core.touchIDSession(["bwbio", "unlock", "--raw"])
             DispatchQueue.main.async {
                 self.unlocking = false
-                if !session.isEmpty { self.send(["op": "unlock", "session": session]) }
+                if let session { self.send(["op": "unlock", "session": session]) }
             }
         }
+    }
+
+    /// Runs an unlock command with no terminal. With no Touch ID path, `bw` falls back to a
+    /// password prompt, reads EOF from /dev/null and prints nothing, so this returns nil.
+    static func touchIDSession(_ args: [String]) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        p.arguments = args
+        p.environment = ["PATH": toolPath, "HOME": NSHomeDirectory()]
+        let out = Pipe()
+        p.standardInput = FileHandle.nullDevice
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        let s = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // A bw session key is 64 random bytes, base64: 88 characters.
+        return s.count == 88 && Data(base64Encoded: s) != nil ? s : nil
     }
 
     func lock() { send(["op": "lock"]) }

@@ -344,7 +344,7 @@ struct Architecture: View {
                              subtitle: "ap-client UserClient", pill: "on_credential_request()", width: 340, mono: true)
                     }
                     HStack(spacing: 0) {
-                        VLine(t: t, height: 44, label: "bwbio").frame(width: 340)
+                        VLine(t: t, height: 44, label: "bw or bwbio").frame(width: 340)
                         Spacer().frame(width: 220)
                         VLine(t: t, height: 44, label: "BW_SESSION in child env").frame(width: 340)
                     }
