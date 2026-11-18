@@ -227,10 +227,14 @@ final class Core: ObservableObject {
         switch e["ev"] as? String {
         case "status":
             switch e["state"] as? String {
-            case "unlocked": state = .unlocked; restartDelay = 1
-            case "locked": state = .locked; restartDelay = 1
+            case "unlocked": state = .unlocked
+            case "locked": state = .locked
             case "connecting": if state != .unlocked && state != .locked { state = .connecting }
-            case "listening": if state == .connecting || state == .starting { state = .locked }
+            case "listening":
+                // Only a core that reached the relay ends the backoff (#8). Every core says
+                // "locked" as its first line, before it has tried anything.
+                restartDelay = 1
+                if state == .connecting || state == .starting { state = .locked }
             case "offline": state = .offline(e["detail"] as? String ?? "offline")
             default: break
             }
