@@ -393,7 +393,8 @@ final class Core: ObservableObject {
 
 // MARK: - Presence check
 
-/// Biometrics only (#5): Touch ID or a paired Apple Watch, never the login password.
+/// Touch ID only (#5). This policy accepts neither the login password nor an Apple Watch
+/// (the watch would need `.deviceOwnerAuthenticationWithBiometricsOrWatch`).
 /// A script with Accessibility access can click and type, but cannot touch the sensor.
 /// The caller creates the context first so it can recognise this exact prompt later (#7).
 func confirmPresence(_ ctx: LAContext, _ reason: String, _ done: @escaping (Bool) -> Void) {

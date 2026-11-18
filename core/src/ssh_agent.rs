@@ -634,6 +634,11 @@ fn is_terminal_host(path: &str) -> bool {
 /// - an interactive shell, i.e. a shell whose parent is a terminal host.
 ///
 /// It never climbs to the terminal itself, so one approval can't cover every tab.
+///
+/// Limit: helpers and shells are recognised by executable name, and a process may `exec`
+/// into one after starting `ssh`. So a program started directly from the anchor's shell or
+/// agent can make its request look like the anchor's own. The anchor separates sessions
+/// (tabs, agents); it does not separate the programs inside one session.
 fn anchor_of(pid: i32) -> Option<Peer> {
     let mut cur = pid;
     for _ in 0..16 {

@@ -346,7 +346,7 @@ struct Architecture: View {
                     HStack(spacing: 0) {
                         VLine(t: t, height: 44, label: "bw or bwbio").frame(width: 340)
                         Spacer().frame(width: 220)
-                        VLine(t: t, height: 44, label: "BW_SESSION in child env").frame(width: 340)
+                        VLine(t: t, height: 44, label: "session via bw's stdin").frame(width: 340)
                     }
                     HStack(spacing: 220) {
                         Card(t: t, icon: "touchid", tint: Color(red: 0.9, green: 0.25, blue: 0.45), title: "Bitwarden Desktop",

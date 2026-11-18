@@ -53,7 +53,8 @@ type into that terminal can approve for you.
 - The notch grows open and shows the item's own name, the username, whether a current 2FA code comes with it,
   which device is asking, and a countdown.
 - Touch ID starts as soon as a request appears on an empty island: touch the sensor to allow. When
-  requests queue up, the next one waits for a click, so one touch can't release two things. The fingerprint fills red
+  requests queue up, or one follows another within two seconds, the next one waits for a click, so one
+  touch can't release two things. The fingerprint fills red
   as it's released. Cancel the prompt and the request stays open; click **Allow** to bring Touch ID
   back. **Allow 10m** auto-approves the same device and item for a window
   you choose (5–60 min). **Deny**, or no answer within 110 s, refuses the request.
@@ -140,7 +141,7 @@ flowchart LR
         D["Bitwarden Desktop<br/>Touch ID unlock"]
         N -- "stdin: decisions, session" --> C
         C -- "stdout: request metadata only" --> N
-        C -- "BW_SESSION in child env only" --> BW
+        C -- "session through bw's stdin" --> BW
         N -- "Touch ID unlock (bw or bwbio)" --> D
     end
     AAC <-- "E2E Noise tunnel via relay" --> C
@@ -153,12 +154,13 @@ flowchart LR
 | Attack | Why it fails |
 |---|---|
 | Agent types `y` into the approval prompt | There is no prompt to type into. The only approval channel is NodWarden's private stdin pipe to `aac-core`. |
-| Script clicks **Allow** or types your password (AppleScript, Accessibility) | Allow needs Touch ID or a paired Apple Watch. The login password is not accepted. |
+| Script clicks **Allow** or types your password (AppleScript, Accessibility) | Allow needs Touch ID. The login password and Apple Watch are not accepted. |
 | Agent reads the vault session from `ps` while `bw` runs | `bw` gets the session through its stdin, set inside the process. It never appears in any process's argv or environment. |
-| Agent sends many requests to fish out the session | Nothing secret is fetched before approval; only item names and usernames. At most 3 requests per device wait at once. |
-| Agent fakes the host or purpose of an SSH signature | The host comes from a verified `session-bind` (the server's host key must sign the session). A login is only labelled a login if the data is a userauth request for that session. Anything else is shown as "unverified data". |
-| Agent reuses your "Allow 10m" | The window covers one key, one verified host, logins only, and one exact program instance. A different program, host, or purpose asks again. Git signing is never auto-allowed. |
-| A fake `bw` or `node` planted on PATH | Tools are resolved to absolute paths at start. Anything in a directory other users can write is refused. Both binaries run with hardened runtime. |
+| Agent sends many requests to fish out the session | Nothing secret leaves `aac-core` before approval: the lookup keeps only the item's name, username and URL. At most 3 requests per device are in progress at once. |
+| Agent fakes the host or purpose of an SSH signature | The host comes from a verified `session-bind` (the server's host key must sign the session). A login is only labelled a login if the data is exactly a userauth request for that session and that key. Anything else is shown as "unverified data". |
+| A host you reached with `ssh -A` uses your agent | The request is shown as forwarded from that host, needs Touch ID every time, and no Allow window applies to it. |
+| Agent reuses your "Allow 10m" | The window covers one key, one verified host, logins only, and the shell or agent session it was opened from. Another terminal tab, another agent, another host or purpose asks again. Git signing is never auto-allowed. A program you start from that same shell or agent while the window is open can use it. |
+| A fake `bw` or `node` planted on PATH | Tools are resolved to absolute paths at start. A path that another user could change is refused (administrators excepted: they can already use `sudo`). Both binaries run with hardened runtime. |
 | A new device tries to pair | Only your reusable PSK is accepted. Rendezvous pairing is refused. |
 | You walk away | Requests time out after 110 s. Sleep or screen lock locks NodWarden: keys and approval windows are cleared and `bw lock` runs. |
 
@@ -169,7 +171,9 @@ same commit as `aac` 0.11.0. It uses the same `~/.access-protocol` pairing files
 ## Requirements
 
 - macOS 14+, Apple silicon. Without a notch, NodWarden hangs from the menu bar as a pill.
-- [Bitwarden CLI](https://bitwarden.com/help/cli/) (`bw`), logged in.
+- [Bitwarden CLI](https://bitwarden.com/help/cli/) (`bw`), logged in. It must be the Node build
+  (`npm install -g @bitwarden/cli`, or Homebrew), with `node` installed. The standalone binary download is
+  refused: NodWarden hands `bw` the session through Node's stdin so that it never shows in a process environment.
 - [Bitwarden Desktop](https://bitwarden.com/download/) with Touch ID unlock enabled.
 - For Touch ID unlock, **one** of:
   - `bw` **≥ 2026.10.0** with the server flag `biometrics-sdk-ipc` on. On Vaultwarden ≥ 1.37.5, set
@@ -190,6 +194,7 @@ open ~/Applications/NodWarden.app
 To start it at login, add `~/Applications/NodWarden.app` to System Settings → General → Login Items.
 
 If `bw`/`bwbio`/`node` live somewhere unusual, set `NODWARDEN_PATH` to a PATH string.
+`~/Applications/NodWarden.app/Contents/MacOS/nodwarden --tools` prints which ones NodWarden will run.
 
 ## Agent side
 
@@ -207,7 +212,8 @@ Don't use `aac connect --output json` for real secrets: it prints them to stdout
 ### What NodWarden guarantees
 
 - An agent never receives your vault or a vault session, only the one item you approved.
-- Nothing is released without Touch ID (or a paired Apple Watch), and nothing but NodWarden can approve.
+- Nothing is released without Touch ID, except inside an Allow window that you opened with Touch ID.
+  Nothing but NodWarden can approve.
 - You see the item's own name, username and requesting device before you decide. For SSH: the verified
   host, the purpose, and the program asking.
 - Secrets go into the agent's child process environment, never to NodWarden's stdout or logs.
@@ -259,7 +265,7 @@ approving, and one touch gives a full session. NodWarden releases one item, and 
 
 **Why Touch ID on Allow?**
 A script can click a button, or even type your password. It can't touch the sensor. NodWarden accepts only
-Touch ID or a paired Apple Watch, so with the lid closed and no watch, nothing can be approved.
+Touch ID (no password, no Apple Watch), so with the lid closed and no Touch ID keyboard, nothing can be approved.
 
 **Why a relay?**
 Agent Access uses one, so agents can run on other machines. It's end-to-end encrypted, so it can't read your secrets,
@@ -275,7 +281,8 @@ like triggering Bitwarden Desktop's Touch ID unlock. Run agents as a separate ma
 See [Security model](#security-model).
 
 **Does it phone home?**
-No. NodWarden makes no network requests of its own. `aac-core` talks only to the Agent Access relay.
+No. NodWarden makes no network requests of its own. `aac-core` talks only to the Agent Access relay,
+and `bw` talks to your Bitwarden server as it always does.
 Item icons are drawn locally from the name's first letter.
 
 **Where are the logs?**
