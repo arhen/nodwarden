@@ -62,7 +62,7 @@ type into that terminal can approve for you.
 
 | State | Notch |
 |---|---|
-| **Idle, unlocked.** The mark sits beside the notch with a green dot. | <img src="assets/states/1-idle.png" width="420"> |
+| **Idle, unlocked.** The mark sits beside the notch with a green open lock (red when locked). | <img src="assets/states/1-idle.png" width="420"> |
 | **Request.** The island grows down with everything you need to decide. | <img src="assets/states/3-request.png" width="420"> |
 | **Released.** A short confirmation, then it folds back. | <img src="assets/states/5-approved.png" width="420"> |
 | **Locked.** Click the island to unlock with Touch ID. Locked = every request is denied. | <img src="assets/states/7-locked-pinned.png" width="420"> |

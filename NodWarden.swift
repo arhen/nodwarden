@@ -389,8 +389,10 @@ struct IslandView: View {
                     Image(systemName: "touchid").font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(.pink).symbolEffect(.pulse)
                 } else {
-                    Circle().fill(stateColor).frame(width: 7, height: 7)
-                        .shadow(color: stateColor.opacity(0.7), radius: 3)
+                    Image(systemName: lockSymbol)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(stateColor)
+                        .contentTransition(.symbolEffect(.replace))
                 }
             }
         }
@@ -457,7 +459,8 @@ struct IslandView: View {
                 Mark(size: 30)
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
-                        Circle().fill(stateColor).frame(width: 7, height: 7)
+                        Image(systemName: lockSymbol).font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(stateColor)
                         Text(stateLabel).font(.system(size: 14, weight: .semibold))
                     }
                     Text(stateDetail).font(.system(size: 12)).foregroundStyle(.white.opacity(0.6))
@@ -512,8 +515,9 @@ struct IslandView: View {
     var stateColor: Color {
         switch core.state {
         case .unlocked: return .green
+        case .locked: return .red
         case .offline: return .orange
-        default: return .white.opacity(0.7)
+        case .starting: return .white.opacity(0.7)
         }
     }
 
@@ -708,6 +712,7 @@ func snapshot(to dir: String) {
         try? png.write(to: URL(fileURLWithPath: "\(dir)/\(name).png"))
     }
     shot("1-idle") { $0.state = .unlocked }
+    shot("1b-idle-locked") { $0.state = .locked }
     shot("2-hover", true) { $0.state = .unlocked }
     shot("3-request") { $0.state = .unlocked; $0.queue = [sample] }
     shot("4-queue") { $0.state = .unlocked; $0.queue = [sample, sample] }
