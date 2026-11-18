@@ -532,7 +532,8 @@ struct IslandView: View {
 struct Mark: View {
     let size: CGFloat
     static let image: NSImage? = {
-        guard let url = Bundle.main.url(forResource: "mark", withExtension: "png"),
+        let beside = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("mark.png")
+        guard let url = Bundle.main.url(forResource: "mark", withExtension: "png") ?? beside,
               let img = NSImage(contentsOf: url) else { return nil }
         img.isTemplate = true
         return img
@@ -688,8 +689,9 @@ func snapshot(to dir: String) {
         let core = Core()
         setup(core)
         let v = IslandView(core: core, layout: Layout(), hoveringInitial: hover, pinnedInitial: pinned)
-            .frame(width: 640, height: 240)
-            .background(Color(white: 0.32))
+            .frame(width: 640, height: 190)
+            .background(LinearGradient(colors: [Color(red: 0.16, green: 0.20, blue: 0.32), Color(red: 0.08, green: 0.09, blue: 0.14)],
+                                       startPoint: .top, endPoint: .bottom))
         let r = ImageRenderer(content: v)
         r.scale = 2
         guard let img = r.nsImage, let tiff = img.tiffRepresentation,
