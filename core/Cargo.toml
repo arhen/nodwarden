@@ -1,0 +1,22 @@
+[package]
+name = "aac-core"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Pinned to bitwarden/agent-access v0.11.0 (3b000d15), the same commit as the
+# installed `aac` binary, so the wire protocol and on-disk pairing files match.
+[dependencies]
+ap-client = { git = "https://github.com/bitwarden/agent-access", rev = "3b000d15af71be5ddcf8893b099f3a66d386be9d", features = ["native-websocket"] }
+ap-noise = { git = "https://github.com/bitwarden/agent-access", rev = "3b000d15af71be5ddcf8893b099f3a66d386be9d" }
+ap-proxy-protocol = { git = "https://github.com/bitwarden/agent-access", rev = "3b000d15af71be5ddcf8893b099f3a66d386be9d" }
+async-trait = "0.1"
+dirs = "5.0"
+hex = "0.4"
+secrecy = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.36", features = ["macros", "rt-multi-thread", "sync", "time", "io-std", "io-util", "process"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
