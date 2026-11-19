@@ -31,6 +31,30 @@ struct SSHInfo: Equatable {
     var canRemember = true
 }
 
+/// An open Allow window, as the core reports it (#5).
+struct AllowWindow: Identifiable, Equatable {
+    let id: String
+    /// "login", "git", "secret" or "other".
+    let kind: String
+    let title: String
+    let sub: String
+    let until: Date
+    let total: Double
+}
+
+/// A device that paired with a token, or a token no device has used yet (#3).
+struct Agent: Identifiable, Equatable {
+    let id: String
+    let name: String?
+    /// Paired / created, and last connected (devices only).
+    let since: Date
+    var seen: Date? = nil
+    /// Tokens: the device seen using it, if NodWarden has recorded one.
+    var usedBy: String? = nil
+    /// "Unnamed · 7f3a9c" for the ones made before naming existed.
+    var label: String { name ?? "Unnamed · \(id.prefix(6))" }
+}
+
 enum VaultState: Equatable { case starting, locked, unlocked, offline(String) }
 
 enum Outcome: Hashable {

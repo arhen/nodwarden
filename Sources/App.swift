@@ -17,7 +17,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var cancellables = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ n: Notification) {
-        let frameW: CGFloat = 640, frameH: CGFloat = 360
+        // Tall enough for the Agents page; clicks outside the island fall through anyway.
+        let frameW: CGFloat = 640, frameH: CGFloat = 600
         panel = IslandPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.level = .statusBar + 1
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
@@ -131,6 +132,55 @@ func snapshot(to dir: String) {
               let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else { return }
         try? png.write(to: URL(fileURLWithPath: "\(dir)/\(name).png"))
     }
+    // The status pages size themselves after layout, which a one-pass render doesn't do: draw
+    // them in the island shape directly.
+    func page(_ name: String, _ p: Page, _ setup: (Core) -> Void) {
+        let core = Core()
+        setup(core)
+        let v = PanelView(core: core, page: .constant(p))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 26).padding(.top, 46).padding(.bottom, 22)
+            .frame(width: 460)
+            .background(IslandShape(top: 8, bottom: 30).fill(.black))
+            .environment(\.colorScheme, .dark)
+            .padding(.horizontal, 90).padding(.bottom, 40)
+            .frame(width: 640, alignment: .top)
+            .background(LinearGradient(colors: [Color(red: 0.16, green: 0.20, blue: 0.32), Color(red: 0.08, green: 0.09, blue: 0.14)],
+                                       startPoint: .top, endPoint: .bottom))
+        let r = ImageRenderer(content: v)
+        r.scale = 2
+        guard let img = r.nsImage, let tiff = img.tiffRepresentation,
+              let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else { return }
+        try? png.write(to: URL(fileURLWithPath: "\(dir)/\(name).png"))
+    }
+    let now = Date()
+    let agents: (Core) -> Void = {
+        $0.state = .unlocked
+        $0.paired = [Agent(id: "7f3a9c0011", name: "claude-code", since: now.addingTimeInterval(-86400), seen: now),
+                     Agent(id: "9b21de4400", name: nil, since: now.addingTimeInterval(-90000), seen: now.addingTimeInterval(-32400))]
+        $0.tokens = [Agent(id: "825a9a1100", name: nil, since: now.addingTimeInterval(-90000), seen: now.addingTimeInterval(-300), usedBy: "claude-code"),
+                     Agent(id: "a1", name: "test-device", since: now),
+                     Agent(id: "6394ec75fc", name: nil, since: now.addingTimeInterval(-86400))]
+    }
+    page("p1-home", .home) { $0.state = .unlocked; $0.keyCount = 14 }
+    page("p2-home-windows", .home) {
+        $0.state = .unlocked
+        $0.keyCount = 14
+        $0.windows = [AllowWindow(id: "a", kind: "git", title: "Git signing", sub: "Signin Key · zsh", until: now.addingTimeInterval(1500), total: 3600),
+                      AllowWindow(id: "b", kind: "git", title: "Git signing", sub: "Signin Key · zsh", until: now.addingTimeInterval(900), total: 3600),
+                      AllowWindow(id: "c", kind: "login", title: "git@github.com", sub: "Github Key · zsh", until: now.addingTimeInterval(1200), total: 3600),
+                      AllowWindow(id: "d", kind: "login", title: "root@203.0.113.7", sub: "Server Key · fish", until: now.addingTimeInterval(240), total: 600)]
+    }
+    page("p3-home-locked", .home) { $0.state = .locked }
+    page("p3b-home-locked-error", .home) { $0.state = .locked; $0.lastError = "Touch ID unlock failed or was cancelled" }
+    page("p4-agents", .agents, agents)
+    page("p4b-agents-empty", .agents) { $0.state = .unlocked }
+    page("p5-confirm-device", .confirm(.device(Agent(id: "9b21de4400", name: nil, since: now))), agents)
+    page("p5b-confirm-all", .confirm(.all), agents)
+    page("p6-new-token", .newToken) { $0.state = .unlocked }
+    page("p6b-rename", .rename(Agent(id: "825a9a1100", name: nil, since: now), device: false)) { $0.state = .unlocked }
+    page("p7-token-created", .home) { $0.state = .unlocked; $0.token = "not-a-real-token" }
+
     shot("1-idle") { $0.state = .unlocked }
     shot("1b-idle-locked") { $0.state = .locked }
     shot("2-hover", true) { $0.state = .unlocked }
@@ -159,8 +209,11 @@ func snapshot(to dir: String) {
     shot("7-locked-pinned", false, true) { $0.state = .locked }
     shot("7b-unlocked-windows", false, true) {
         $0.state = .unlocked
-        $0.windows = [("git signing · zsh", Date().addingTimeInterval(540)),
-                      ("login git@github.com · zsh", Date().addingTimeInterval(1500))]
+        $0.keyCount = 14
+        $0.windows = [AllowWindow(id: "a", kind: "git", title: "Git signing", sub: "Signin Key · zsh", until: Date().addingTimeInterval(1500), total: 3600),
+                      AllowWindow(id: "b", kind: "git", title: "Git signing", sub: "Signin Key · zsh", until: Date().addingTimeInterval(900), total: 3600),
+                      AllowWindow(id: "c", kind: "login", title: "git@github.com", sub: "Github Key · zsh", until: Date().addingTimeInterval(1200), total: 3600),
+                      AllowWindow(id: "d", kind: "login", title: "root@203.0.113.7", sub: "Server Key · fish", until: Date().addingTimeInterval(240), total: 600)]
     }
     shot("7c-locked-error", false, true) { $0.state = .locked; $0.lastError = "Touch ID unlock failed or was cancelled" }
     shot("8-unlocking") { $0.state = .locked; $0.unlocking = true }

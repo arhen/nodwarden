@@ -208,8 +208,13 @@ When more than one vault item matches a domain, the request is denied. Use `--id
 Don't use `aac connect --output json` for real secrets: it prints them to stdout.
 
 **Pairing token.** On first run, NodWarden shows a reusable token in the status panel (click the
-island); Copy keeps it on this Mac only. **New agent token** makes another one. Earlier tokens keep
-working. The relay must be reachable to make a token.
+island); Copy keeps it on this Mac only. The relay must be reachable to make a token.
+
+**Agents.** Click the island, then ⚙. It lists paired devices and tokens, with when each token was
+last used and by which device (recorded by NodWarden from 0.0.1 on). From there you can make a
+named token, rename a device or token, remove one, or revoke everything. Removing takes Touch ID.
+Agent connections drop for a couple of seconds while the list is applied; the vault and the SSH
+agent stay as they are.
 
 **Without the relay.** The SSH agent and unlock work offline; only agent credential requests need the
 relay.

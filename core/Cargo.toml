@@ -9,6 +9,7 @@ publish = false
 # installed `aac` binary, so the wire protocol and on-disk pairing files match.
 [dependencies]
 ap-client = { git = "https://github.com/bitwarden/agent-access", rev = "3b000d15af71be5ddcf8893b099f3a66d386be9d", features = ["native-websocket"] }
+ap-proxy-client = { git = "https://github.com/bitwarden/agent-access", rev = "3b000d15af71be5ddcf8893b099f3a66d386be9d", default-features = false }
 ap-noise = { git = "https://github.com/bitwarden/agent-access", rev = "3b000d15af71be5ddcf8893b099f3a66d386be9d" }
 ap-proxy-protocol = { git = "https://github.com/bitwarden/agent-access", rev = "3b000d15af71be5ddcf8893b099f3a66d386be9d" }
 async-trait = "0.1"

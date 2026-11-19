@@ -8,6 +8,7 @@ version = "0.0.1"
 dependencies = [
  "ap-client",
  "ap-noise",
+ "ap-proxy-client",
  "ap-proxy-protocol",
  "async-trait",
  "dirs",

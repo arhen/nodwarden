@@ -111,14 +111,10 @@ struct IslandView: View {
     /// Shown under the buttons when Touch ID can't run (#28); cleared on the next attempt.
     @State private var touchIDProblem: String?
 
-    /// The status panel grows with what it shows: token row, open windows, last error.
-    var statusHeight: CGFloat {
-        var h: CGFloat = 104
-        if core.token != nil { h += 34 }
-        if !core.windows.isEmpty { h += CGFloat(core.windows.count) * 16 + 40 }
-        if core.token == nil, core.lastError != nil { h += 30 }
-        return h
-    }
+    /// Which status page shows when the island is open with no request.
+    @State private var page: Page = .home
+    /// The open panel's measured height; it sizes itself to what the page shows.
+    @State private var panelHeight: CGFloat = 0
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var notch: Notch { layout.notch }
 
@@ -151,8 +147,11 @@ struct IslandView: View {
         case .compact: return CGSize(width: max(notch.width, 120) + ear * 2, height: notch.height)
         case .result: return CGSize(width: max(notch.width + 140, 360), height: notch.height + resultRow)
         case .expanded:
-            return CGSize(width: max(notch.width + 200, 440),
-                          height: notch.height + (current != nil ? 106 + (touchIDProblem != nil ? 30 : 0) : statusHeight))
+            if current != nil {
+                return CGSize(width: max(notch.width + 200, 440),
+                              height: notch.height + 106 + (touchIDProblem != nil ? 30 : 0))
+            }
+            return CGSize(width: max(notch.width + 240, 460), height: max(panelHeight, notch.height + 60))
         }
     }
 
@@ -192,6 +191,9 @@ struct IslandView: View {
         .onChange(of: layout.dismissTick) { _, _ in
             if pinned { withAnimation(springClose) { pinned = false } }
         }
+        .onChange(of: pinned) { _, p in if !p { page = .home } }
+        // A new token is shown once: keep the panel open on it.
+        .onChange(of: core.token) { _, t in if t != nil, current == nil { withAnimation(springOpen) { pinned = true } } }
         .onChange(of: current?.id) { old, id in
             cancelPrompt()
             shownAt = Date()
@@ -214,10 +216,13 @@ struct IslandView: View {
         touchIDProblem = nil
     }
 
-    /// Status panel folds back once the pointer has been away for a moment.
+    /// Status panel folds back once the pointer has been away for a moment. Not on a page you
+    /// are working in (typing a name, confirming, a token to copy): those close on Esc, an
+    /// outside click or their own buttons.
     func collapseSoon() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-            if !hovering, pinned { withAnimation(springClose) { pinned = false } }
+            guard !hovering, pinned, page == .home || page == .agents, core.token == nil else { return }
+            withAnimation(springClose) { pinned = false }
         }
     }
 
@@ -417,82 +422,17 @@ struct IslandView: View {
     }
 
     var statusView: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 10) {
-                Mark(size: 30)
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 6) {
-                        Image(systemName: lockSymbol).font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(stateColor)
-                            .modifier(SymbolSwap())
-                        Text(stateLabel).font(.system(size: 14, weight: .semibold))
-                            .contentTransition(.interpolate)
-                    }
-                    Text(stateDetail).font(.system(size: 12)).foregroundStyle(.white.opacity(0.6))
-                        .contentTransition(.interpolate)
-                }
-                Spacer()
-            }
-            if let token = core.token {
-                HStack {
-                    Text("New agent token").font(.system(size: 12)).foregroundStyle(.white.opacity(0.6))
-                    Spacer()
-                    Button("Copy") {
-                        // Current host only (no Universal Clipboard), and marked concealed so
-                        // clipboard managers don't keep it (#6).
-                        let pb = NSPasteboard.general
-                        pb.prepareForNewContents(with: .currentHostOnly)
-                        pb.declareTypes([.string, NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")], owner: nil)
-                        pb.setString(token, forType: .string)
-                        pb.setString("", forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))
-                        core.token = nil
-                    }
-                    .buttonStyle(Pill(.quiet))
-                }
-            }
-            if !core.windows.isEmpty {
-                // Open windows are visible and can be ended, so one you didn't mean to open is
-                // caught (#5).
-                VStack(alignment: .leading, spacing: 3) {
-                    ForEach(Array(core.windows.enumerated()), id: \.offset) { _, w in
-                        Text("Allowed: \(w.what) · ends \(w.until, style: .relative)")
-                            .font(.system(size: 11)).foregroundStyle(.white.opacity(0.7)).lineLimit(1)
-                    }
-                    Button("End all") { core.endWindows() }.buttonStyle(Pill(.quiet))
-                }
-            }
-            if core.token == nil, let err = core.lastError {
-                // The latest error stays until a later success clears it (#14, #28).
-                Text(err).font(.system(size: 11)).foregroundStyle(.orange.opacity(0.8)).lineLimit(2)
-            }
-            HStack {
-                Spacer()
-                ZStack {
-                    switch core.state {
-                    case .unlocked:
-                        HStack(spacing: 8) {
-                            Button("New agent token") {
-                                // Cancel makes no token; an empty name makes an unnamed one.
-                                if let name = askDeviceName() { core.newToken(name: name) }
-                            }.buttonStyle(Pill(.quiet))
-                            Button("Lock") { core.lock() }.buttonStyle(Pill(.quiet))
-                        }
-                        .transition(.blurSwap(y: 6))
-                    case .locked:
-                        Button(core.unlocking ? "Waiting for Touch ID…" : "Unlock with Touch ID") { core.unlock() }
-                            .buttonStyle(Pill(.primary))
-                            .transition(.blurSwap(y: 6))
-                    default:
-                        EmptyView()
-                    }
-                }
-            }
-        }
-        .animation(reduceMotion ? .easeOut(duration: 0.15) : springSwap, value: core.state)
-        .animation(reduceMotion ? .easeOut(duration: 0.15) : springSwap, value: core.unlocking)
-        .padding(.top, notch.height + 10)
-        .padding(.bottom, 16)
-        .transition(.opacity.animation(springOpen.delay(0.06)))
+        PanelView(core: core, page: $page)
+            .padding(.top, notch.height + 10)
+            .padding(.bottom, 18)
+            .padding(.horizontal, 4)
+            .fixedSize(horizontal: false, vertical: true)
+            .background(GeometryReader { g in
+                Color.clear
+                    .onAppear { panelHeight = g.size.height }
+                    .onChange(of: g.size.height) { _, h in panelHeight = h }
+            })
+            .transition(.opacity.animation(springOpen.delay(0.06)))
     }
 
     /// `auto` is the prompt that starts by itself when a request appears; anything else is a click.
@@ -545,40 +485,9 @@ struct IslandView: View {
     }
 
 
-    var lockSymbol: String {
-        switch core.state {
-        case .unlocked: return "lock.open.fill"
-        case .offline: return "wifi.exclamationmark"
-        default: return "lock.fill"
-        }
-    }
-
-    var stateColor: Color {
-        switch core.state {
-        case .unlocked: return .green
-        case .locked: return .red
-        case .offline: return .orange
-        case .starting: return .white.opacity(0.7)
-        }
-    }
-
-    var stateLabel: String {
-        switch core.state {
-        case .unlocked: return "Unlocked"
-        case .locked: return "Locked"
-        case .starting: return "Starting"
-        case .offline: return "Offline"
-        }
-    }
-
-    var stateDetail: String {
-        switch core.state {
-        case .unlocked: return "Vault unlocked · \(core.relayNote ?? "requests need your approval")"
-        case .locked: return "Vault locked · \(core.relayNote ?? "agent requests are denied")"
-        case .starting: return "Starting…"
-        case .offline(let why): return why
-        }
-    }
+    var lockSymbol: String { core.lockSymbol }
+    var stateColor: Color { core.stateColor }
+    var stateLabel: String { core.stateLabel }
 }
 
 /// The NodWarden mark (fingerprint into key), drawn as a template image so it
@@ -710,43 +619,35 @@ struct AllowButton: View {
 }
 
 struct Pill: ButtonStyle {
-    enum Kind { case primary, quiet }
+    enum Kind { case primary, quiet, danger }
+    static let dangerText = Color(red: 1, green: 0.45, blue: 0.45)
     let kind: Kind
     var flat = false
     var compact = false
-    init(_ kind: Kind, flat: Bool = false, compact: Bool = false) {
-        self.kind = kind; self.flat = flat; self.compact = compact
+    var height: CGFloat = 30
+    init(_ kind: Kind, flat: Bool = false, compact: Bool = false, height: CGFloat = 30) {
+        self.kind = kind; self.flat = flat; self.compact = compact; self.height = height
+    }
+
+    var fill: Color {
+        switch kind {
+        case .primary: return .white
+        case .quiet: return .white.opacity(0.14)
+        case .danger: return .red.opacity(0.18)
+        }
     }
 
     func makeBody(configuration c: Configuration) -> some View {
         c.label
             .font(.system(size: 13, weight: .semibold))
-            .foregroundStyle(kind == .primary ? .black : .white)
+            .foregroundStyle(kind == .primary ? Color.black : (kind == .danger ? Pill.dangerText : .white))
             .padding(.leading, compact ? 4 : 16)
             .padding(.trailing, compact ? 12 : (flat ? 6 : 16))
-            .frame(height: 30)
-            .background(flat ? Color.clear : (kind == .primary ? Color.white : Color.white.opacity(0.14)), in: Capsule())
+            .frame(height: height)
+            .background(flat ? Color.clear : fill, in: Capsule())
             .opacity(c.isPressed ? 0.8 : 1)
             .scaleEffect(c.isPressed ? 0.96 : 1)
             .animation(.easeOut(duration: 0.1), value: c.isPressed)
             .contentShape(Capsule())
     }
-}
-
-/// Asks what the new token is for, so requests show "laptop-ci" instead of a hex id
-/// (round-3 #21). Returns nil on Cancel, "" for no name.
-@MainActor
-func askDeviceName() -> String? {
-    let alert = NSAlert()
-    alert.messageText = "Name this agent"
-    alert.informativeText = "Requests from the device that uses this token will show this name."
-    let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-    field.placeholderString = "e.g. laptop-claude, ci-runner"
-    alert.accessoryView = field
-    alert.addButton(withTitle: "Create token")
-    alert.addButton(withTitle: "Cancel")
-    NSApp.activate(ignoringOtherApps: true)
-    alert.window.initialFirstResponder = field
-    guard alert.runModal() == .alertFirstButtonReturn else { return nil }
-    return field.stringValue.trimmingCharacters(in: .whitespaces)
 }

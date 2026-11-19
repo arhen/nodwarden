@@ -13,7 +13,12 @@ final class Core: ObservableObject {
     /// The latest error, shown in the status panel until a later success clears it (#14).
     @Published var lastError: String?
     /// Open Allow windows, as the core reports them (#5): what each covers and when it ends.
-    @Published var windows: [(what: String, until: Date)] = []
+    @Published var windows: [AllowWindow] = []
+    /// Paired devices and unused tokens (#3), refreshed when the Agents view opens.
+    @Published var paired: [Agent] = []
+    @Published var tokens: [Agent] = []
+    /// SSH keys loaded, for the header.
+    @Published var keyCount = 0
     /// The reusable PSK token, when aac-core mints a new one (#19).
     @Published var token: String?
     /// Why the relay is not connected, while it isn't. Separate from the vault state: with
@@ -144,6 +149,7 @@ final class Core: ObservableObject {
             case "locked":
                 state = .locked
                 unlocking = false
+                keyCount = 0
                 lockWatchdog?.cancel()
                 if let d = e["detail"] as? String, !d.isEmpty { note(.error, d) }
             case "connecting":
@@ -160,9 +166,22 @@ final class Core: ObservableObject {
         case "windows":
             let items = e["items"] as? [[String: Any]] ?? []
             windows = items.compactMap { i in
-                guard let w = i["what"] as? String, let secs = i["secs"] as? Double else { return nil }
-                return (w, Date().addingTimeInterval(secs))
+                guard let id = i["id"] as? String, let secs = i["secs"] as? Double else { return nil }
+                return AllowWindow(id: id, kind: i["kind"] as? String ?? "other", title: i["title"] as? String ?? "",
+                                   sub: i["sub"] as? String ?? "", until: Date().addingTimeInterval(secs),
+                                   total: max(1, i["total"] as? Double ?? secs))
             }
+        case "keys":
+            keyCount = e["count"] as? Int ?? 0
+        case "agents":
+            func date(_ v: Any?) -> Date { Date(timeIntervalSince1970: v as? Double ?? 0) }
+            let labels = Dictionary(paired.map { ($0.id, $0.label) }, uniquingKeysWith: { a, _ in a })
+            tokens = (e["tokens"] as? [[String: Any]] ?? []).compactMap { t in
+                guard let id = t["id"] as? String else { return nil }
+                let last = (t["last_used"] as? Double).map { Date(timeIntervalSince1970: $0) }
+                let device = (t["device"] as? String).map { labels[$0] ?? "Unnamed · \($0.prefix(6))" }
+                return Agent(id: id, name: t["name"] as? String, since: date(t["created"]), seen: last, usedBy: device)
+            }.sorted { ($0.seen ?? .distantPast, $0.since) > ($1.seen ?? .distantPast, $1.since) }
         case "log":
             if let m = e["msg"] as? String { note(e["level"] as? String == "error" ? .error : .info, m) }
         case "request":
@@ -338,8 +357,21 @@ final class Core: ObservableObject {
         send(obj)
     }
 
-    /// Ends every open Allow window (#5).
-    func endWindows() { send(["op": "end_windows"]) }
+    /// Ends these Allow windows, or every one (#5).
+    func endWindows(_ ids: [String]? = nil) {
+        var obj: [String: Any] = ["op": "end_windows"]
+        if let ids { obj["ids"] = ids }
+        send(obj)
+    }
+
+    func loadAgents() { send(["op": "agents"]) }
+    /// Agent connections drop for about 2 s while the relay client restarts (#3).
+    func removeDevice(_ id: String) { send(["op": "remove_device", "id": id]) }
+    func removeToken(_ id: String) { send(["op": "remove_token", "id": id]) }
+    func revokeAll() { send(["op": "revoke_all"]) }
+    func rename(_ a: Agent, device: Bool, to name: String) {
+        send(["op": device ? "rename_device" : "rename_token", "id": a.id, "name": name])
+    }
 
     enum Level { case info, error }
 

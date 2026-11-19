@@ -80,6 +80,14 @@ impl Peer {
     }
 }
 
+/// A window's id: a hash of what it covers. Labels take no part, so it stays the same.
+fn window_id(k: &AllowKey) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    k.hash(&mut h);
+    format!("s{:016x}", h.finish())
+}
+
 /// What the agent asks the main loop. `reply` gets true to sign.
 pub struct SignAsk {
     pub key_name: String,
@@ -108,6 +116,7 @@ impl SignAsk {
         allow_key(&self.fingerprint, &self.host_key, &self.user, &self.purpose, &self.peer, &self.via)
             .map(|mut k| {
                 k.host_label = Label(self.host.clone().unwrap_or_default());
+                k.key_label = Label(self.key_name.clone());
                 k
             })
     }
@@ -140,6 +149,8 @@ struct AllowKey {
     host_key: Option<String>,
     /// Shown in the status panel only. Not part of what the window matches on.
     host_label: Label,
+    /// The key's name, for the status panel only.
+    key_label: Label,
     /// The login user: a window for deploy@server never covers root@server (#4).
     user: Option<String>,
     purpose: String,
@@ -170,6 +181,7 @@ fn allow_key(
         fingerprint: fingerprint.to_owned(),
         host_key: host_key.clone(),
         host_label: Label::default(),
+        key_label: Label::default(),
         user: user.clone(),
         purpose: purpose.to_owned(),
         peer: peer.clone(),
@@ -179,7 +191,8 @@ fn allow_key(
 #[derive(Default)]
 pub struct State {
     pub keys: Vec<Key>,
-    allowed: HashMap<AllowKey, Instant>,
+    /// Window -> (ends at, its full length in seconds).
+    allowed: HashMap<AllowKey, (Instant, u64)>,
     waiting: HashMap<i32, usize>,
 }
 
@@ -189,29 +202,32 @@ impl State {
         self.allowed.clear();
     }
 
-    /// Open Allow windows, for the status panel (#5): what each covers and seconds left.
-    pub fn windows(&mut self) -> Vec<(String, u64)> {
+    /// Open Allow windows, for the status panel (#5). `id` is stable for a window, so the UI can
+    /// end one.
+    pub fn windows(&mut self) -> Vec<Value> {
         let now = Instant::now();
-        self.allowed.retain(|_, t| *t > now);
-        let mut v: Vec<(String, u64)> = self
-            .allowed
+        self.allowed.retain(|_, (t, _)| *t > now);
+        self.allowed
             .iter()
-            .map(|(k, t)| {
-                let what = match (&k.user, k.purpose.as_str()) {
-                    (Some(u), "login") => format!("login {u}@{} · {}", k.host_label, k.peer.name()),
-                    (_, "git signing") => format!("git signing · {}", k.peer.name()),
-                    _ => k.purpose.clone(),
+            .map(|(k, (t, total))| {
+                let (kind, title) = match (&k.user, k.purpose.as_str()) {
+                    (Some(u), "login") => ("login", format!("{u}@{}", k.host_label)),
+                    (_, "git signing") => ("git", "Git signing".to_string()),
+                    _ => ("other", k.purpose.clone()),
                 };
-                (what, t.saturating_duration_since(now).as_secs())
+                json!({"id": window_id(k), "kind": kind, "title": title,
+                       "sub": format!("{} · {}", k.key_label, k.peer.name()),
+                       "secs": t.saturating_duration_since(now).as_secs(), "total": total})
             })
-            .collect();
-        v.sort();
-        v
+            .collect()
     }
 
-    /// Ends every open Allow window (#5).
-    pub fn end_windows(&mut self) {
-        self.allowed.clear();
+    /// Ends the windows with these ids, or all of them (#5).
+    pub fn end_windows(&mut self, ids: Option<&[String]>) {
+        match ids {
+            Some(ids) => self.allowed.retain(|k, _| !ids.contains(&window_id(k))),
+            None => self.allowed.clear(),
+        }
     }
 
     /// Takes a place in the queue for the user, unless this program or everyone together
@@ -538,7 +554,7 @@ async fn sign(
         Some(k) => {
             let mut st = state.lock().await;
             let now = Instant::now();
-            st.allowed.retain(|_, t| *t > now);
+            st.allowed.retain(|_, (t, _)| *t > now);
             st.allowed.contains_key(k)
         }
         None => false,
@@ -607,7 +623,8 @@ async fn peer_closed(sock: &UnixStream) {
 /// Remembers an approval for exactly what was shown. Unidentified requests are never cached.
 pub async fn allow_for(state: &Shared, ask: &SignAsk, until: Instant) {
     if let Some(key) = ask.allow_key() {
-        state.lock().await.allowed.insert(key, until);
+        let total = until.saturating_duration_since(Instant::now()).as_secs();
+        state.lock().await.allowed.insert(key, (until, total));
     }
 }
 
@@ -1223,14 +1240,22 @@ mod tests {
         // ssh-keygen runs a new process each time, so a window keyed on that process would
         // never match; the anchor is this test process, which stays the same.
         assert_eq!(*asked.lock().unwrap(), [false, true], "first asks, second is covered by the window");
-        assert_eq!(state.lock().await.windows().len(), 1, "one open window");
+        let open = state.lock().await.windows();
+        assert_eq!(open.len(), 1, "one open window");
+        // Ending another id leaves it; ending its own id closes it, and the next one asks.
+        state.lock().await.end_windows(Some(&["s0".to_string()]));
+        assert_eq!(state.lock().await.windows().len(), 1, "other ids leave it open");
+        state.lock().await.end_windows(Some(&[open[0]["id"].as_str().unwrap().to_string()]));
+        assert!(state.lock().await.windows().is_empty(), "its own id ends it");
+        assert!(sign(4).await, "fourth signature");
+        assert_eq!(*asked.lock().unwrap(), [false, true, false], "after ending it, it asks again");
 
         // Lock: keys and windows cleared. Unlock again (keys back): the next signature asks.
         state.lock().await.clear();
         assert!(state.lock().await.windows().is_empty(), "lock clears windows");
         state.lock().await.keys = keys();
         assert!(sign(3).await, "third signature");
-        assert_eq!(*asked.lock().unwrap(), [false, true, false], "after a lock the window is gone");
+        assert_eq!(*asked.lock().unwrap(), [false, true, false, false], "after a lock the window is gone");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

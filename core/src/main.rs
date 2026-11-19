@@ -7,12 +7,18 @@
 //!   stdin  {"op":"unlock","session":"..."}
 //!          {"op":"decide","id":N,"decision":"approve"|"deny"|"approve_for","minutes":M}
 //!          {"op":"lock"}
-//!          {"op":"new_token"}                            mint a reusable PSK (needs the relay)
+//!          {"op":"new_token","name":..}                  mint a reusable PSK (needs the relay)
+//!          {"op":"end_windows","ids":[..]?}              end these Allow windows, or all
+//!          {"op":"agents"}                               list paired devices and tokens
+//!          {"op":"remove_device","id":..} | {"op":"remove_token","id":..} | {"op":"revoke_all"}
+//!          {"op":"rename_device","id":..,"name":..} | {"op":"rename_token","id":..,"name":..}
 //!   stdout {"ev":"status","state":"locked"|"unlocked"|"connecting"|"listening"|"offline","detail":..}
 //!            locked/unlocked: the vault. connecting/listening: the relay, which does not change
 //!            the vault state. offline: fatal, the process exits.
 //!          {"ev":"token","token":..}                      reusable PSK, once, when minted
-//!          {"ev":"windows","items":[{"what":..,"until":secs}]}   open Allow windows (#5)
+//!          {"ev":"windows","items":[{"id","kind","title","sub","secs","total"}]}   open Allow windows (#5)
+//!          {"ev":"agents","paired":[{"id","name","paired","seen"}],"tokens":[{"id","name","created"}]}
+//!          {"ev":"keys","count":N}                        SSH keys loaded
 //!          {"ev":"request","id":N,"name":..,"domain":..,"username":..,"device":..,"kind":..,"has_totp":..}
 //!          {"ev":"ssh_request","id":N,...}                see ssh_agent::ask_json
 //!          {"ev":"resolved","id":N,"outcome":"approved"|"denied"|"auto"|"expired"|"not_found"|"locked"|"cancelled"}
@@ -25,13 +31,17 @@ mod ssh_agent;
 mod storage;
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ap_client::{
     ConnectionStore, CredentialData, CredentialQuery, CredentialRequestReply, DefaultProxyClient,
-    FingerprintVerificationReply, IdentityFingerprint, PskStore, UserClient, UserClientNotification,
-    UserClientRequest,
+    FingerprintVerificationReply, IdentityFingerprint, ProxyClient, PskStore, UserClient,
+    UserClientNotification, UserClientRequest,
 };
+use ap_proxy_client::IncomingMessage;
+use ap_proxy_protocol::IdentityKeyPair;
 use secrecy::SecretString;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -59,8 +69,32 @@ enum Cmd {
     /// Mint a new reusable pairing token and show it once (#27). Needs the relay. An optional
     /// name labels the device that pairs with it (round-3 #21).
     NewToken { name: Option<String> },
-    /// End every open Allow window (#5).
-    EndWindows,
+    /// End these Allow windows, or every one (#5).
+    EndWindows { ids: Option<Vec<String>> },
+    /// List paired devices and pairing tokens (#3 on GitHub).
+    Agents,
+    /// Forget a paired device, and the token with its name. Restarts the relay client (#3).
+    RemoveDevice { id: String },
+    RemoveToken { id: String },
+    /// Forget every paired device and token (#3).
+    RevokeAll,
+    /// Rename a device (and the token it pairs with) or a token. Empty means unnamed.
+    RenameDevice { id: String, name: String },
+    RenameToken { id: String, name: String },
+}
+
+impl Cmd {
+    /// Commands that edit the pairing files, which needs a fresh relay client (#3).
+    fn edits_pairings(&self) -> bool {
+        matches!(self, Cmd::RemoveDevice { .. } | Cmd::RemoveToken { .. } | Cmd::RevokeAll
+            | Cmd::RenameDevice { .. } | Cmd::RenameToken { .. })
+    }
+}
+
+/// A name from the user: trimmed, printable, at most 40 characters; empty means none.
+fn clean_name(n: &str) -> Option<String> {
+    let n: String = n.trim().chars().filter(|c| !c.is_control()).take(40).collect();
+    (!n.is_empty()).then_some(n)
 }
 
 /// A credential request waiting for the user. Nothing secret is kept (#1): the lookup
@@ -204,6 +238,206 @@ fn device_label(conns: &[ap_client::ConnectionInfo], id: &IdentityFingerprint) -
         .unwrap_or_else(|| hex::encode(id.0).chars().take(12).collect())
 }
 
+/// When each pairing token was last used, and by which device: ~/.nodwarden/token-usage.json.
+/// Agent Access keeps neither, so NodWarden records them from the handshakes it sees (#3).
+/// psk_id -> {"last": unix secs, "device": identity hex}. Holds no secret.
+fn usage_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".nodwarden/token-usage.json"))
+}
+
+fn read_usage() -> serde_json::Map<String, Value> {
+    usage_path()
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn write_usage(m: &serde_json::Map<String, Value>) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let Some(p) = usage_path() else { return };
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = p.with_extension("tmp");
+    let ok = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, Value::Object(m.clone()).to_string().as_bytes()));
+    if ok.is_ok() {
+        let _ = std::fs::rename(&tmp, &p);
+    }
+}
+
+/// The token a handshake names, if this relay message is one. Only the id: the message
+/// carries no secret, and it is passed on unchanged.
+fn handshake_token(payload: &[u8]) -> Option<String> {
+    let v: Value = serde_json::from_slice(payload).ok()?;
+    (v.get("type")?.as_str()? == "handshake-init").then_some(())?;
+    v.get("psk_id")?.as_str().filter(|id| id.len() <= 128).map(str::to_owned)
+}
+
+fn record_use(psk_id: String, device: &IdentityFingerprint) {
+    let mut m = read_usage();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    m.insert(psk_id, json!({"last": now, "device": hex::encode(device.0)}));
+    write_usage(&m);
+}
+
+/// A credential window's id, stable while it is open.
+fn approval_id(k: &(IdentityFingerprint, String)) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    k.hash(&mut h);
+    format!("c{:016x}", h.finish())
+}
+
+/// Paired devices and pairing tokens, as stored on disk. Never the PSK itself.
+async fn emit_agents() {
+    let paired: Vec<Value> = match FileConnectionCache::load_or_create("user_client") {
+        Ok(c) => c.list().await.iter().map(|c| json!({
+            "id": hex::encode(c.fingerprint.0), "name": c.name,
+            "paired": c.cached_at, "seen": c.last_connected_at,
+        })).collect(),
+        Err(_) => Vec::new(),
+    };
+    let usage = read_usage();
+    let tokens: Vec<Value> = match FilePskStore::load_or_create("user_client") {
+        Ok(p) => PskStore::list(&p).await.iter().map(|p| {
+            let u = usage.get(&p.psk_id);
+            json!({
+                "id": p.psk_id, "name": p.name, "created": p.created_at,
+                "last_used": u.and_then(|u| u.get("last")), "device": u.and_then(|u| u.get("device")),
+            })
+        }).collect(),
+        Err(_) => Vec::new(),
+    };
+    emit(json!({"ev":"agents","paired":paired,"tokens":tokens}));
+}
+
+/// What a remove/revoke command keeps: (devices to keep, token ids to drop).
+///
+/// Removing a device also drops its token: a reusable token lets the device pair again. Its
+/// token is the one recorded as used by it, or one with the same name.
+fn plan_removal(cmd: &Cmd, conns: Vec<ap_client::ConnectionInfo>, tokens: &[ap_client::PskEntry],
+                usage: &serde_json::Map<String, Value>) -> (Vec<ap_client::ConnectionInfo>, Vec<String>)
+{
+    let ids = |f: &dyn Fn(&ap_client::PskEntry) -> bool| tokens.iter().filter(|t| f(t)).map(|t| t.psk_id.clone()).collect();
+    match cmd {
+        Cmd::RevokeAll => (Vec::new(), ids(&|_| true)),
+        Cmd::RemoveToken { id } => (conns, ids(&|t| t.psk_id == *id)),
+        Cmd::RemoveDevice { id } => {
+            let (gone, keep): (Vec<_>, Vec<_>) = conns.into_iter().partition(|c| hex::encode(c.fingerprint.0) == *id);
+            let name = gone.first().and_then(|c| c.name.clone());
+            let used_by = |t: &ap_client::PskEntry| usage.get(&t.psk_id).and_then(|u| u.get("device")).and_then(Value::as_str) == Some(id.as_str());
+            (keep, ids(&|t| (name.is_some() && t.name == name) || used_by(t)))
+        }
+        _ => (conns, Vec::new()),
+    }
+}
+
+/// Edits the pairing files for a remove/revoke command. Run only while no relay client is
+/// alive: it keeps its own copy of both files and would write it back (#3).
+async fn edit_pairings(cmd: &Cmd) -> Result<(), String> {
+    let e = |e: ap_client::ClientError| e.to_string();
+    let mut conns = FileConnectionCache::load_or_create("user_client").map_err(e)?;
+    let mut psks = FilePskStore::load_or_create("user_client").map_err(e)?;
+    let mut usage = read_usage();
+    let tokens = PskStore::list(&psks).await;
+    match cmd {
+        Cmd::RenameToken { id, name } => {
+            if let Some(mut t) = tokens.into_iter().find(|t| t.psk_id == *id) {
+                t.name = clean_name(name);
+                psks.save(t).await.map_err(e)?;
+            }
+            return Ok(());
+        }
+        Cmd::RenameDevice { id, name } => {
+            let all = conns.list().await;
+            let Some(mut c) = all.into_iter().find(|c| hex::encode(c.fingerprint.0) == *id) else { return Ok(()) };
+            // Its token goes along, so the next pairing from it gets the same name.
+            let ids: Vec<String> = plan_removal(&Cmd::RemoveDevice { id: id.clone() }, vec![c.clone()], &tokens, &usage).1;
+            let old = c.name.clone();
+            c.name = clean_name(name);
+            for mut t in tokens.into_iter().filter(|t| ids.contains(&t.psk_id) && t.name == old) {
+                t.name = c.name.clone();
+                psks.save(t).await.map_err(e)?;
+            }
+            conns.save(c).await.map_err(e)?;
+            return Ok(());
+        }
+        _ => {}
+    }
+    let (keep, drop) = plan_removal(cmd, conns.list().await, &tokens, &usage);
+    for id in drop {
+        psks.remove(&id).await.map_err(e)?;
+        usage.remove(&id);
+    }
+    write_usage(&usage);
+    // The cache has no remove: clear it and put the others back.
+    conns.clear().await.map_err(e)?;
+    for c in keep {
+        conns.save(c).await.map_err(e)?;
+    }
+    tighten_access_protocol_perms();
+    Ok(())
+}
+
+/// The relay transport, with a switch to retire it. A retired one never connects again, so a
+/// replaced client can't come back with the pairings it had in memory, and dropping it closes
+/// the websocket instead of leaving it to time out (#3).
+struct Relay {
+    inner: DefaultProxyClient,
+    retired: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl ProxyClient for Relay {
+    async fn connect(&mut self, id: IdentityKeyPair) -> Result<mpsc::UnboundedReceiver<IncomingMessage>, ap_client::ClientError> {
+        if self.retired.load(Ordering::SeqCst) {
+            return Err(ap_client::ClientError::ConnectionFailed("relay client replaced".into()));
+        }
+        // Pass every message on unchanged; note which token each handshake uses (#3).
+        let mut from_relay = self.inner.connect(id).await?;
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(m) = from_relay.recv().await {
+                if let IncomingMessage::Send { source, payload, .. } = &m
+                    && let Some(psk_id) = handshake_token(payload)
+                {
+                    let source = *source;
+                    let _ = tokio::task::spawn_blocking(move || record_use(psk_id, &source)).await;
+                }
+                if tx.send(m).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(rx)
+    }
+    async fn request_rendezvous(&self) -> Result<(), ap_client::ClientError> {
+        self.inner.request_rendezvous().await
+    }
+    async fn request_identity(&self, code: ap_client::RendezvousCode) -> Result<(), ap_client::ClientError> {
+        self.inner.request_identity(code).await
+    }
+    async fn send_to(&self, to: IdentityFingerprint, data: Vec<u8>) -> Result<(), ap_client::ClientError> {
+        self.inner.send_to(to, data).await
+    }
+    async fn disconnect(&mut self) -> Result<(), ap_client::ClientError> {
+        self.inner.disconnect().await
+    }
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        let mut c = std::mem::replace(&mut self.inner, DefaultProxyClient::from_url(String::new()));
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                let _ = c.disconnect().await;
+            });
+        }
+    }
+}
+
 /// Makes the identity key, the other pairing files and their directory private (#26: upstream
 /// writes them 0644). Only files: 0600 on a directory would make it unusable.
 fn tighten_perms(dir: &std::path::Path) {
@@ -271,8 +505,9 @@ struct Core {
     /// Lookups still running, per device. Counted with `pending` against
     /// MAX_PENDING_PER_DEVICE, or a burst would get past the limit before anything is waiting.
     looking: HashMap<IdentityFingerprint, usize>,
-    /// (device, item id) -> allowed until. Keyed on the item, not the query (#22).
-    approvals: HashMap<(IdentityFingerprint, String), Instant>,
+    /// (device, item id) -> (allowed until, window length in seconds, item name). Keyed on the
+    /// item, not the query (#22).
+    approvals: HashMap<(IdentityFingerprint, String), (Instant, u64, String)>,
     ssh_state: ssh_agent::Shared,
     ssh_pending: HashMap<u64, (ssh_agent::SignAsk, Instant)>,
     done_tx: mpsc::Sender<Done>,
@@ -367,16 +602,29 @@ impl Core {
     /// Tells the UI which Allow windows are open (#5). Credential windows are per item.
     async fn report_windows(&mut self) {
         let now = Instant::now();
+        let labels = self.device_labels().await.to_vec();
         let mut items: Vec<Value> = self
             .approvals
             .iter()
-            .filter(|(_, t)| **t > now)
-            .map(|(_, t)| json!({"what":"credential (one item, one device)","secs":t.saturating_duration_since(now).as_secs()}))
+            .filter(|(_, (t, _, _))| *t > now)
+            .map(|(k, (t, total, name))| json!({
+                "id": approval_id(k), "kind": "secret", "title": name,
+                "sub": format!("secret · {}", device_label(&labels, &k.0)),
+                "secs": t.saturating_duration_since(now).as_secs(), "total": total,
+            }))
             .collect();
-        for (what, secs) in self.ssh_state.lock().await.windows() {
-            items.push(json!({"what":what,"secs":secs}));
-        }
+        items.extend(self.ssh_state.lock().await.windows());
         emit(json!({"ev":"windows","items":items}));
+    }
+
+    /// Denies credential requests still waiting, and ends credential windows: they belong to
+    /// relay connections that are being replaced (#3).
+    fn drop_agent_requests(&mut self) {
+        self.approvals.clear();
+        for (id, (p, _)) in self.pending.drain() {
+            let _ = p.reply.send(deny_reply());
+            emit(json!({"ev":"resolved","id":id,"outcome":"cancelled"}));
+        }
     }
 
     /// True while anything can expire, so the tick can stop otherwise (#13).
@@ -432,11 +680,15 @@ impl Core {
             Cmd::Lock => self.lock_all("").await,
             // Handled in run(): it needs the relay client.
             Cmd::NewToken { .. } => {}
-            Cmd::EndWindows => {
-                self.approvals.clear();
-                self.ssh_state.lock().await.end_windows();
+            Cmd::EndWindows { ids } => {
+                match &ids {
+                    Some(ids) => self.approvals.retain(|k, _| !ids.contains(&approval_id(k))),
+                    None => self.approvals.clear(),
+                }
+                self.ssh_state.lock().await.end_windows(ids.as_deref());
                 self.report_windows().await;
             }
+            Cmd::Agents => emit_agents().await,
             Cmd::Decide { id, decision, minutes } => {
                 let approve = matches!(decision.as_str(), "approve" | "approve_for");
                 let window = (decision == "approve_for")
@@ -457,11 +709,13 @@ impl Core {
                     return;
                 }
                 if let Some(w) = window {
-                    self.approvals.insert((p.identity, p.item_id.clone()), Instant::now() + w);
+                    self.approvals.insert((p.identity, p.item_id.clone()), (Instant::now() + w, w.as_secs(), info.name.clone()));
                     self.report_windows().await;
                 }
                 self.release(id, info, p.reply, false);
             }
+            // Handled in run(): they restart the relay client.
+            _ => {}
         }
     }
 
@@ -473,6 +727,7 @@ impl Core {
             }
             Done::Unlocked { session, keys, .. } => {
                 log("info", format!("ssh agent: {} keys", keys.len()));
+                emit(json!({"ev":"keys","count":keys.len()}));
                 self.ssh_state.lock().await.keys = keys;
                 self.session = Some(session);
                 emit(json!({"ev":"status","state":"unlocked"}));
@@ -480,6 +735,7 @@ impl Core {
             Done::Synced { epoch, keys } => {
                 if epoch == self.epoch && self.session.is_some() {
                     log("info", format!("ssh agent: {} keys after sync", keys.len()));
+                    emit(json!({"ev":"keys","count":keys.len()}));
                     self.ssh_state.lock().await.keys = keys;
                 }
             }
@@ -520,7 +776,7 @@ impl Core {
                     emit(json!({"ev":"resolved","id":id,"outcome":"locked","query":query_key}));
                     return;
                 }
-                if self.approvals.get(&(identity, info.id.clone())).is_some_and(|t| *t > Instant::now()) {
+                if self.approvals.get(&(identity, info.id.clone())).is_some_and(|(t, _, _)| *t > Instant::now()) {
                     self.release(id, info, reply, true);
                     return;
                 }
@@ -607,7 +863,7 @@ impl Core {
     fn on_tick(&mut self) {
         let now = Instant::now();
         let before = self.approvals.len();
-        self.approvals.retain(|_, t| *t > now);
+        self.approvals.retain(|_, (t, _, _)| *t > now);
         if self.approvals.len() != before {
             self.windows_dirty = true;
         }
@@ -677,14 +933,14 @@ async fn run() -> Result<(), String> {
     emit(json!({"ev":"status","state":"locked"}));
     emit(json!({"ev":"status","state":"connecting"}));
 
-    let identity = FileIdentityStorage::load_or_generate("user_client").map_err(|e| e.to_string())?;
-    let store = FileConnectionCache::load_or_create("user_client").map_err(|e| e.to_string())?;
-    let psk_store = FilePskStore::load_or_create("user_client").map_err(|e| e.to_string())?;
-    let existing = PskStore::list(&psk_store).await;
+    FileIdentityStorage::load_or_generate("user_client").map_err(|e| e.to_string())?;
+    FileConnectionCache::load_or_create("user_client").map_err(|e| e.to_string())?;
+    let existing = PskStore::list(&FilePskStore::load_or_create("user_client").map_err(|e| e.to_string())?).await;
     tighten_access_protocol_perms();
 
     // Connect to the relay in the background, retrying with backoff; the agent keeps working.
-    let mut relay_rx = connect_relay(identity, store, psk_store);
+    let mut retired = Arc::new(AtomicBool::new(false));
+    let mut relay_rx = connect_relay(retired.clone());
 
     let mut client: Option<UserClient> = None;
     let mut notes: Option<mpsc::Receiver<UserClientNotification>> = None;
@@ -698,13 +954,13 @@ async fn run() -> Result<(), String> {
     // stall Lock, sleep lock and timeouts until the relay is back (#1). Mint off the loop.
     let mint = |c: UserClient, name: Option<String>| {
         // Names come from the user, but keep them short and printable anyway.
-        let name = name.map(|n| n.trim().chars().filter(|c| !c.is_control()).take(40).collect::<String>())
-            .filter(|n| !n.is_empty());
+        let name = name.as_deref().and_then(clean_name);
         tokio::spawn(async move {
             match tokio::time::timeout(Duration::from_secs(10), c.get_psk_token(name, true)).await {
                 Ok(Ok(token)) => {
                     emit(json!({"ev":"token","token":token}));
                     tighten_access_protocol_perms();
+                    emit_agents().await;
                 }
                 Ok(Err(e)) => log("error", format!("new token failed: {e}")),
                 Err(_) => log("error", "new token timed out; is the relay reachable?"),
@@ -721,6 +977,29 @@ async fn run() -> Result<(), String> {
                     Some(c) if relay_up => mint(c.clone(), name),
                     _ => log("error", "new token needs the relay; try again when connected"),
                 },
+                cmd if cmd.edits_pairings() => {
+                    // ap-client keeps tokens and devices in memory and has no command to drop one,
+                    // so retire this client, edit the files, and connect a new one that reads
+                    // them. The vault, the keys and the SSH agent are not touched (#3).
+                    retired.store(true, Ordering::SeqCst);
+                    client = None;
+                    requests = None;
+                    relay_up = false;
+                    // The old client's loop ends once its handles are gone; its notification
+                    // channel closing says so. It must be gone before the files change.
+                    if let Some(mut n) = notes.take() {
+                        let _ = tokio::time::timeout(Duration::from_secs(1), async { while n.recv().await.is_some() {} }).await;
+                    }
+                    core.drop_agent_requests();
+                    core.report_windows().await;
+                    if let Err(e) = edit_pairings(&cmd).await {
+                        log("error", format!("could not update pairings: {e}"));
+                    }
+                    emit_agents().await;
+                    retired = Arc::new(AtomicBool::new(false));
+                    relay_rx = connect_relay(retired.clone());
+                    emit(json!({"ev":"status","state":"connecting","detail":"reconnecting with the new list"}));
+                }
                 other => core.on_cmd(other).await,
             },
             Some(done) = done_rx.recv() => core.on_done(done).await,
@@ -784,40 +1063,26 @@ async fn run() -> Result<(), String> {
 }
 
 /// Connects to the relay in the background, retrying with backoff (2 s doubling to 60 s), and
-/// hands over the client once it's up. The SSH agent and unlock never wait for this (#24).
-fn connect_relay(
-    identity: FileIdentityStorage,
-    store: FileConnectionCache,
-    psk_store: FilePskStore,
-) -> mpsc::Receiver<Result<ap_client::UserClientHandle, String>> {
+/// hands over the client once it's up. Reads the pairing files on each attempt. The SSH agent
+/// and unlock never wait for this (#24). Gives up once `retired` is set.
+fn connect_relay(retired: Arc<AtomicBool>) -> mpsc::Receiver<Result<ap_client::UserClientHandle, String>> {
     let (relay_tx, relay_rx) = mpsc::channel::<Result<ap_client::UserClientHandle, String>>(1);
-    let mut parts = Some((identity, store, psk_store));
     tokio::spawn(async move {
         let mut delay = Duration::from_secs(2);
-        loop {
-            let (identity, store, psk_store) = match parts.take() {
-                Some(p) => p,
-                None => match (
-                    FileIdentityStorage::load_or_generate("user_client"),
-                    FileConnectionCache::load_or_create("user_client"),
-                    FilePskStore::load_or_create("user_client"),
-                ) {
-                    (Ok(i), Ok(s), Ok(p)) => (i, s, p),
-                    _ => {
-                        let _ = relay_tx.send(Err("cannot read ~/.access-protocol".into())).await;
-                        return;
-                    }
-                },
+        while !retired.load(Ordering::SeqCst) {
+            let (identity, store, psk_store) = match (
+                FileIdentityStorage::load_or_generate("user_client"),
+                FileConnectionCache::load_or_create("user_client"),
+                FilePskStore::load_or_create("user_client"),
+            ) {
+                (Ok(i), Ok(s), Ok(p)) => (i, s, p),
+                _ => {
+                    let _ = relay_tx.send(Err("cannot read ~/.access-protocol".into())).await;
+                    return;
+                }
             };
-            match UserClient::connect(
-                Box::new(identity),
-                Box::new(store),
-                Box::new(DefaultProxyClient::from_url(PROXY_URL.to_string())),
-                None,
-                Some(Box::new(psk_store)),
-            )
-            .await
-            {
+            let relay = Relay { inner: DefaultProxyClient::from_url(PROXY_URL.to_string()), retired: retired.clone() };
+            match UserClient::connect(Box::new(identity), Box::new(store), Box::new(relay), None, Some(Box::new(psk_store))).await {
                 Ok(h) => {
                     let _ = relay_tx.send(Ok(h)).await;
                     return;
@@ -954,6 +1219,70 @@ mod tests {
         assert!(core.looking.is_empty() && core.pending.is_empty());
     }
 
+    #[test]
+    fn removing_a_device_drops_its_named_token_and_keeps_the_rest() {
+        let conn = |b: u8, name: Option<&str>| ap_client::ConnectionInfo {
+            fingerprint: IdentityFingerprint([b; 32]), name: name.map(Into::into),
+            cached_at: 1, last_connected_at: 2, transport_state: None,
+        };
+        let token = |id: &str, name: Option<&str>| ap_client::PskEntry {
+            psk_id: id.into(), psk: ap_client::Psk::generate(), name: name.map(Into::into), created_at: 1,
+        };
+        let conns = vec![conn(1, Some("laptop")), conn(2, None), conn(3, Some("ci"))];
+        let tokens = [token("t1", Some("laptop")), token("t2", None), token("t3", Some("ci"))];
+        let fps = |v: &[ap_client::ConnectionInfo]| v.iter().map(|c| c.fingerprint.0[0]).collect::<Vec<_>>();
+
+        let none = serde_json::Map::new();
+        let (keep, drop) = plan_removal(&Cmd::RemoveDevice { id: hex::encode([1u8; 32]) }, conns.clone(), &tokens, &none);
+        assert_eq!((fps(&keep), drop), (vec![2, 3], vec!["t1".to_string()]), "named device takes its token");
+
+        let (keep, drop) = plan_removal(&Cmd::RemoveDevice { id: hex::encode([2u8; 32]) }, conns.clone(), &tokens, &none);
+        assert_eq!((fps(&keep), drop), (vec![1, 3], vec![]), "unnamed device, no record: no token can be matched");
+
+        let mut usage = serde_json::Map::new();
+        usage.insert("t2".into(), json!({"last": 5, "device": hex::encode([2u8; 32])}));
+        let (_, drop) = plan_removal(&Cmd::RemoveDevice { id: hex::encode([2u8; 32]) }, conns.clone(), &tokens, &usage);
+        assert_eq!(drop, vec!["t2".to_string()], "unnamed device takes the token it was seen using");
+
+        let (keep, drop) = plan_removal(&Cmd::RemoveToken { id: "t2".into() }, conns.clone(), &tokens, &none);
+        assert_eq!((fps(&keep), drop), (vec![1, 2, 3], vec!["t2".to_string()]), "a token alone keeps devices");
+
+        let (keep, drop) = plan_removal(&Cmd::RevokeAll, conns, &tokens, &none);
+        assert_eq!((keep.len(), drop.len()), (0, 3), "revoke all clears both");
+    }
+
+    #[test]
+    fn only_a_handshake_names_a_token() {
+        assert_eq!(handshake_token(br#"{"type":"handshake-init","data":"x","ciphersuite":"y","psk_id":"ab12"}"#), Some("ab12".into()));
+        assert_eq!(handshake_token(br#"{"type":"handshake-init","data":"x","ciphersuite":"y"}"#), None, "rendezvous: no token");
+        assert_eq!(handshake_token(br#"{"type":"credential-request","psk_id":"ab12"}"#), None);
+        assert_eq!(handshake_token(b"not json"), None);
+    }
+
+    /// Every decision reaches its request: approve starts the release (and an Allow window
+    /// opens), deny answers no. Guards the command match against a catch-all arm above it.
+    #[tokio::test]
+    async fn decisions_reach_their_requests() {
+        let (mut core, mut done, _locks) = test_core();
+        core.session = Some(session());
+        let device = IdentityFingerprint([9; 32]);
+        let info = || ItemInfo { id: "item-1".into(), name: "GitHub".into(), username: None, uri: None, domain: None, has_totp: false };
+        let pending = |tx| Pending { identity: device, item_id: "item-1".into(), reply: tx, deadline: Instant::now() + REQUEST_TIMEOUT };
+
+        let (tx, _rx) = oneshot::channel();
+        core.pending.insert(1, (pending(tx), info()));
+        core.on_cmd(Cmd::Decide { id: 1, decision: "approve_for".into(), minutes: Some(5) }).await;
+        assert!(core.pending.is_empty(), "approve takes the request");
+        assert_eq!(core.approvals.len(), 1, "approve_for opens a window");
+        let released = tokio::time::timeout(Duration::from_secs(5), done.recv()).await.unwrap();
+        assert!(matches!(released, Some(Done::Released { id: 1, .. })), "approve starts the release");
+
+        let (tx, rx) = oneshot::channel();
+        core.pending.insert(2, (pending(tx), info()));
+        core.on_cmd(Cmd::Decide { id: 2, decision: "deny".into(), minutes: None }).await;
+        assert!(!rx.await.unwrap().approved, "deny answers no");
+    }
+
     #[tokio::test]
     async fn lock_denies_everything_waiting_and_forgets_approvals() {
         let (mut core, _done, _locks) = test_core();
@@ -962,7 +1291,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let info = ItemInfo { id: "item-1".into(), name: "GitHub".into(), username: None, uri: None, domain: None, has_totp: false };
         core.pending.insert(1, (Pending { identity: device, item_id: "item-1".into(), reply: tx, deadline: Instant::now() + REQUEST_TIMEOUT }, info));
-        core.approvals.insert((device, "item-1".into()), Instant::now() + Duration::from_secs(600));
+        core.approvals.insert((device, "item-1".into()), (Instant::now() + Duration::from_secs(600), 600, "GitHub".into()));
         core.lock_all("").await;
         assert!(!rx.await.unwrap().approved);
         assert!(core.session.is_none() && core.pending.is_empty() && core.approvals.is_empty());
