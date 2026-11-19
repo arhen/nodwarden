@@ -16,7 +16,7 @@ NodWarden is a macOS front end for [Bitwarden Agent Access](https://github.com/b
 Agents use the standard `aac` client; NodWarden replaces the listener on your Mac.
 
 > [!WARNING]
-> **Alpha (0.0.1).** NodWarden is very early software, and it builds on Bitwarden Agent Access, which is
+> **Alpha (0.0.x).** NodWarden is very early software, and it builds on Bitwarden Agent Access, which is
 > itself in early preview. Expect breaking changes. Always use `aac run`, so the secret goes to the
 > process, never into the model's context.
 
@@ -211,7 +211,7 @@ Don't use `aac connect --output json` for real secrets: it prints them to stdout
 island); Copy keeps it on this Mac only. The relay must be reachable to make a token.
 
 **Agents.** Click the island, then ⚙. It lists paired devices and tokens, with when each token was
-last used and by which device (recorded by NodWarden from 0.0.1 on). From there you can make a
+last used and by which device (recorded by NodWarden from 0.0.2 on). From there you can make a
 named token, rename a device or token, remove one, or revoke everything. Removing takes Touch ID.
 Agent connections drop for a couple of seconds while the list is applied; the vault and the SSH
 agent stay as they are.
