@@ -173,10 +173,13 @@ struct IslandView: View {
                 withAnimation(h ? springOpen : springClose) { hovering = h }
                 if !h, pinned { collapseSoon() }
             }
-            .onTapGesture {
+            // Tapping opens the panel only from the small island. Once it's open, taps belong to
+            // its buttons (End all, Lock, New agent token); it closes on an outside click, Esc or
+            // when the pointer leaves.
+            .gesture(mode == .expanded ? nil : TapGesture().onEnded {
                 guard current == nil else { return }
-                withAnimation(pinned ? springClose : springOpen) { pinned.toggle() }
-            }
+                withAnimation(springOpen) { pinned = true }
+            })
             Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)

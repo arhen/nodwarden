@@ -139,6 +139,7 @@ final class Core: ObservableObject {
             case "unlocked":
                 state = .unlocked
                 unlocking = false
+                lastError = nil // an unlock that worked replaces any earlier failure
                 lockWatchdog?.cancel()
             case "locked":
                 state = .locked
