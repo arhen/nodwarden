@@ -41,14 +41,18 @@ extension Core {
         }
     }
 
-    var stateDetail: String {
+    /// The panel header's dot and line. Nil when all is well: then the header is only the name.
+    var headerStatus: (dot: Color, line: String, tint: Color?, pulse: Bool)? {
         switch state {
+        case .starting: return (.white.opacity(0.45), "Starting…", nil, false)
+        case .offline: return (Tint.bad, "Stopped · restarting…", nil, false)
+        // While unlocking the button says "Waiting for Touch ID…"; the dot breathes.
+        case .locked: return (Tint.bad, "Locked", nil, unlocking)
         case .unlocked:
-            let keys = keyCount == 1 ? "1 SSH key" : "\(keyCount) SSH keys"
-            return "\(keys) · " + (stale ? "offline copy" : relayNote == nil ? "relay connected" : "relay reconnecting")
-        case .locked: return "Agent requests are denied"
-        case .starting: return "Starting…"
-        case .offline(let why): return why
+            if notice?.tone == .error { return (Tint.bad, "Needs attention", Tint.bad, false) }
+            if stale { return (Tint.warn, syncing ? "Syncing…" : "Offline copy", Tint.warn, false) }
+            if relayNote != nil { return (Tint.warn, "Agents paused, reconnecting", Tint.warn, false) }
+            return nil
         }
     }
 }
@@ -124,30 +128,28 @@ struct PanelView: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 12) {
                 Mark(size: 30).opacity(core.state == .unlocked ? 1 : 0.6)
-                VStack(alignment: .leading, spacing: 1) {
-                    HStack(spacing: 6) {
-                        Text(core.stateLabel).font(.system(size: 15, weight: .semibold))
-                            .contentTransition(.interpolate)
-                        Circle().fill(core.stateColor).frame(width: 7, height: 7)
-                            .shadow(color: core.stateColor.opacity(0.8), radius: 4)
+                // The name only when all is well; a dot and one line when something isn't.
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 7) {
+                        Wordmark()
+                        if let st = core.headerStatus {
+                            StateDot(color: st.dot, pulse: st.pulse).transition(.scale.combined(with: .opacity))
+                        }
                     }
-                    if core.state == .unlocked && core.stale {
-                        // Retries by itself; the button is for not waiting.
-                        HStack(spacing: 4) {
-                            Text("\(core.keyCount == 1 ? "1 SSH key" : "\(core.keyCount) SSH keys") ·")
-                                .foregroundStyle(.white.opacity(0.5))
-                            Text(core.syncing ? "syncing…" : "offline copy")
-                                .foregroundStyle(Color(red: 1, green: 0.74, blue: 0.3))
+                    if let st = core.headerStatus {
+                        HStack(spacing: 5) {
+                            Text(st.line)
+                                .foregroundStyle(st.tint ?? .white.opacity(0.55))
                                 .contentTransition(.interpolate)
-                            SyncButton(spinning: core.syncing) { core.refresh() }
+                            if core.state == .unlocked && core.stale && core.notice?.tone != .error {
+                                // Retries by itself; the button is for not waiting.
+                                SyncButton(spinning: core.syncing) { core.refresh() }
+                            }
                         }
                         .font(.system(size: 12))
                         .lineLimit(1)
-                        .help("Working from the copy on this Mac. NodWarden keeps trying the vault server.")
-                    } else {
-                        Text(core.stateDetail)
-                            .font(.system(size: 12)).foregroundStyle(.white.opacity(0.5))
-                            .lineLimit(1).contentTransition(.interpolate)
+                        .transition(.blurSwap(y: -4))
+                        .help(core.stale ? "Working from the copy on this Mac. NodWarden keeps trying the vault server." : "")
                     }
                 }
                 Spacer(minLength: 0)
@@ -185,6 +187,7 @@ struct PanelView: View {
         .animation(reduceMotion ? .easeOut(duration: 0.15) : springSwap, value: core.state)
         .animation(reduceMotion ? .easeOut(duration: 0.15) : springSwap, value: core.windows.map(\.id))
         .animation(reduceMotion ? .easeOut(duration: 0.15) : springSwap, value: core.notice)
+        .animation(reduceMotion ? .easeOut(duration: 0.15) : springSwap, value: core.headerStatus?.line)
     }
 
     func retry(_ r: Notice.Retry) {
@@ -531,6 +534,40 @@ struct PanelView: View {
 
 // MARK: - Building blocks
 
+/// State colours, deeper than the bright brand amber so a dot never reads as part of the logo.
+enum Tint {
+    static let brand = Color(red: 0.92, green: 0.62, blue: 0.05)
+    static let ok = Color(red: 0.16, green: 0.62, blue: 0.33)
+    static let warn = Color(red: 0.89, green: 0.40, blue: 0.10)
+    static let bad = Color(red: 0.85, green: 0.20, blue: 0.20)
+}
+
+/// "Nod" in the brand amber, "Warden" in white, as in the logo.
+struct Wordmark: View {
+    var size: CGFloat = 15
+    var body: some View {
+        (Text("Nod").foregroundColor(Tint.brand) + Text("Warden"))
+            .font(.system(size: size, weight: .heavy))
+            .tracking(-0.2)
+            .accessibilityLabel("NodWarden")
+    }
+}
+
+/// A state dot; it breathes while something is waiting on you.
+struct StateDot: View {
+    let color: Color
+    var pulse = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    var body: some View {
+        if pulse && !reduceMotion {
+            Circle().fill(color).frame(width: 7, height: 7)
+                .phaseAnimator([1.0, 0.3]) { c, o in c.opacity(o) } animation: { _ in .easeInOut(duration: 0.8) }
+        } else {
+            Circle().fill(color).frame(width: 7, height: 7)
+        }
+    }
+}
+
 /// A problem, worded for people: tinted icon, title, one line of what it means, and Retry when
 /// trying again can help.
 struct NoticeCard: View {
@@ -542,8 +579,8 @@ struct NoticeCard: View {
     var tint: Color {
         switch notice.tone {
         case .info: return .white.opacity(0.75)
-        case .warning: return Color(red: 1, green: 0.74, blue: 0.3)
-        case .error: return Color(red: 1, green: 0.45, blue: 0.42)
+        case .warning: return Tint.warn
+        case .error: return Tint.bad
         }
     }
 
@@ -611,12 +648,12 @@ struct SyncButton: View {
         Button(action: action) {
             Image(systemName: "arrow.triangle.2.circlepath")
                 .font(.system(size: 10, weight: .bold))
-                .foregroundStyle(Color(red: 1, green: 0.74, blue: 0.3).opacity(hover ? 1 : 0.8))
+                .foregroundStyle(Tint.warn.opacity(hover ? 1 : 0.8))
                 .rotationEffect(.degrees(spinning && !reduceMotion ? 360 : 0))
                 .animation(spinning && !reduceMotion ? .linear(duration: 1).repeatForever(autoreverses: false) : .default,
                            value: spinning)
                 .frame(width: 18, height: 18)
-                .background(Color(red: 1, green: 0.74, blue: 0.3).opacity(hover ? 0.2 : 0.1), in: Circle())
+                .background(Tint.warn.opacity(hover ? 0.2 : 0.1), in: Circle())
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)

@@ -177,6 +177,10 @@ func snapshot(to dir: String) {
     page("p8-offline-stale", .home) { $0.state = .unlocked; $0.keyCount = 14; $0.stale = true }
     page("p8a-offline-syncing", .home) { $0.state = .unlocked; $0.keyCount = 14; $0.stale = true; $0.syncing = true }
     page("p8b-no-keys", .home) { $0.state = .unlocked; $0.keyCount = 0; $0.stale = true; $0.show("keys_offline") }
+    page("p9-relay-paused", .home) { $0.state = .unlocked; $0.keyCount = 14; $0.relayNote = "relay disconnected" }
+    page("p9b-starting", .home) { $0.state = .starting }
+    page("p9c-stopped", .home) { $0.state = .offline("listener exited (1)") }
+    page("p9d-unlocking", .home) { $0.state = .locked; $0.unlocking = true }
     page("p8c-login", .home) { $0.state = .unlocked; $0.keyCount = 14; $0.stale = true; $0.show("login") }
     page("p4-agents", .agents, agents)
     page("p4b-agents-empty", .agents) { $0.state = .unlocked }
