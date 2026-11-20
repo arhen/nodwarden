@@ -21,7 +21,9 @@
 //!          {"ev":"keys","count":N,"problem":code?}        SSH keys loaded, or why none could be
 //!          {"ev":"sync","ok":bool,"reason":code?}         vault sync result; codes: offline, login,
 //!                                                         timeout, failed (the panel words them)
-//!   stdin  {"op":"refresh"}                               sync again and reload the SSH keys
+//!   stdin  {"op":"refresh"}                               sync now and reload the SSH keys
+//!          {"ev":"syncing"}                               a sync started (Retry, or the
+//!                                                         automatic retry while offline)
 //!          {"ev":"request","id":N,"name":..,"domain":..,"username":..,"device":..,"kind":..,"has_totp":..}
 //!          {"ev":"ssh_request","id":N,...}                see ssh_agent::ask_json
 //!          {"ev":"resolved","id":N,"outcome":"approved"|"denied"|"auto"|"expired"|"not_found"|"locked"|"cancelled"}
@@ -60,6 +62,9 @@ use storage::{FileConnectionCache, FileIdentityStorage, FilePskStore};
 const PROXY_URL: &str = "wss://ap.lesspassword.dev";
 /// How long a request may wait for a decision. The UI shows the same value from each event.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(110);
+/// Retrying the sync while the vault server can't be reached: first wait, and the most.
+const SYNC_RETRY_FIRST: Duration = Duration::from_secs(30);
+const SYNC_RETRY_MAX: Duration = Duration::from_secs(300);
 /// Upper bound for an "Allow N minutes" window; the UI offers 5–60.
 const MAX_ALLOW_MINUTES: u32 = 60;
 /// Requests a single device may have waiting at once (#14).
@@ -560,6 +565,11 @@ struct Core {
     labels_mtime: Option<std::time::SystemTime>,
     /// A credential window expired on the tick; report the list again (#5).
     windows_dirty: bool,
+    /// While the vault server can't be reached: when to try the sync again, and the wait
+    /// after that try. None when the last sync worked, or while locked.
+    retry_sync: Option<(Instant, Duration)>,
+    /// A sync is running; never start a second.
+    syncing: bool,
 }
 
 
@@ -595,6 +605,8 @@ impl Core {
             labels: None,
             labels_mtime: None,
             windows_dirty: false,
+            retry_sync: None,
+            syncing: false,
             // Base request ids on the clock so ids from a restarted core never collide (#30).
             next_id: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -612,6 +624,8 @@ impl Core {
     async fn lock_all(&mut self, why: Option<&str>) {
         self.epoch += 1;
         self.session = None;
+        self.retry_sync = None;
+        self.syncing = false;
         self.approvals.clear();
         self.ssh_state.lock().await.clear();
         for (id, (p, _)) in self.pending.drain() {
@@ -676,6 +690,20 @@ impl Core {
     /// True while anything can expire, so the tick can stop otherwise (#13).
     fn has_deadlines(&self) -> bool {
         !self.approvals.is_empty() || !self.pending.is_empty() || !self.ssh_pending.is_empty()
+            || self.retry_sync.is_some()
+    }
+
+    /// Syncs the vault and reloads the SSH keys, off the loop. One at a time; nothing while
+    /// locked. Keeps the retry wait, so a failure after this backs off further (#30).
+    fn start_sync(&mut self) {
+        let Some(session) = self.session.clone() else { return };
+        if self.syncing {
+            return;
+        }
+        self.syncing = true;
+        emit(json!({"ev":"syncing"}));
+        let (bw, tx, epoch) = (self.bw.clone(), self.done_tx.clone(), self.epoch);
+        tokio::spawn(async move { sync_and_reload(&bw, &session, epoch, &tx).await });
     }
 
     /// Fetches the secret and replies, off the main loop.
@@ -705,15 +733,9 @@ impl Core {
                     // so unlock doesn't wait on the network (#12).
                     let keys = load_keys_logged(&bw, &session).await;
                     let _ = tx.send(Done::Unlocked { epoch, session: session.clone(), keys }).await;
-                    sync_and_reload(&bw, &session, epoch, &tx).await;
                 });
             }
-            Cmd::Refresh => {
-                if let Some(session) = self.session.clone() {
-                    let (bw, tx, epoch) = (self.bw.clone(), self.done_tx.clone(), self.epoch);
-                    tokio::spawn(async move { sync_and_reload(&bw, &session, epoch, &tx).await });
-                }
-            }
+            Cmd::Refresh => self.start_sync(),
             Cmd::Lock => self.lock_all(None).await,
             // Handled in run(): it needs the relay client.
             Cmd::NewToken { .. } => {}
@@ -770,11 +792,22 @@ impl Core {
                 self.ssh_state.lock().await.keys = keys;
                 self.session = Some(session);
                 emit(json!({"ev":"status","state":"unlocked"}));
+                self.start_sync();
             }
             Done::Synced { epoch, sync, keys } => {
                 if epoch != self.epoch || self.session.is_none() {
                     return;
                 }
+                self.syncing = false;
+                // Offline: try again by itself, 30 s doubling to 5 min. A login problem needs
+                // you, so no retry for it.
+                self.retry_sync = match sync {
+                    Some("login") | None => None,
+                    Some(_) => {
+                        let wait = self.retry_sync.map_or(SYNC_RETRY_FIRST, |(_, w)| (w * 2).min(SYNC_RETRY_MAX));
+                        Some((Instant::now() + wait, wait))
+                    }
+                };
                 emit(json!({"ev":"sync","ok":sync.is_none(),"reason":sync}));
                 let mut st = self.ssh_state.lock().await;
                 match keys {
@@ -912,6 +945,9 @@ impl Core {
 
     fn on_tick(&mut self) {
         let now = Instant::now();
+        if self.retry_sync.is_some_and(|(at, _)| at <= now) {
+            self.start_sync();
+        }
         let before = self.approvals.len();
         self.approvals.retain(|_, (t, _, _)| *t > now);
         if self.approvals.len() != before {
@@ -1343,6 +1379,39 @@ mod tests {
         core.pending.insert(2, (pending(tx), info()));
         core.on_cmd(Cmd::Decide { id: 2, decision: "deny".into(), minutes: None }).await;
         assert!(!rx.await.unwrap().approved, "deny answers no");
+    }
+
+    /// Offline, the sync is tried again by itself with a growing wait; a sync that works, a
+    /// login problem, or a lock stops the retries. Retry keeps its place in the backoff.
+    #[tokio::test]
+    async fn offline_sync_retries_by_itself_until_it_works() {
+        let (mut core, _done, _locks) = test_core();
+        core.session = Some(session());
+        let synced = |sync| Done::Synced { epoch: 0, sync, keys: Ok(Vec::new()) };
+        core.syncing = true;
+        core.on_done(synced(Some("offline"))).await;
+        assert_eq!(core.retry_sync.map(|(_, w)| w), Some(SYNC_RETRY_FIRST), "first failure: retry soon");
+        assert!(!core.syncing && core.has_deadlines(), "the tick runs for the retry");
+        core.on_done(synced(Some("timeout"))).await;
+        assert_eq!(core.retry_sync.map(|(_, w)| w), Some(SYNC_RETRY_FIRST * 2), "then back off");
+        for _ in 0..10 {
+            core.on_done(synced(Some("offline"))).await;
+        }
+        assert_eq!(core.retry_sync.map(|(_, w)| w), Some(SYNC_RETRY_MAX), "capped");
+
+        core.retry_sync = Some((Instant::now(), SYNC_RETRY_MAX));
+        core.on_tick();
+        assert!(core.syncing, "due: the tick starts the sync");
+        core.start_sync();
+        core.on_done(synced(None)).await;
+        assert!(core.retry_sync.is_none() && !core.has_deadlines(), "back online: retries stop");
+
+        core.on_done(synced(Some("login"))).await;
+        assert!(core.retry_sync.is_none(), "a login problem needs you; no retry");
+
+        core.on_done(synced(Some("offline"))).await;
+        core.lock_all(None).await;
+        assert!(core.retry_sync.is_none() && !core.syncing, "lock stops retries");
     }
 
     #[tokio::test]

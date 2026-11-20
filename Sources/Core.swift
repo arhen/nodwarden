@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import LocalAuthentication
+import Network
 import SwiftUI
 
 final class Core: ObservableObject {
@@ -13,6 +14,11 @@ final class Core: ObservableObject {
     /// The vault couldn't be synced: the keys come from the copy on this Mac. Shown as a quiet
     /// line, and a dot on the island, until a sync works.
     @Published var stale = false
+    /// A sync is running (Retry, the automatic retry, or the network coming back).
+    @Published var syncing = false
+    /// Syncs as soon as the network comes back while on the offline copy, instead of waiting
+    /// for the next automatic retry.
+    private let network = NWPathMonitor()
     /// Open Allow windows, as the core reports them (#5): what each covers and when it ends.
     @Published var windows: [AllowWindow] = []
     /// Paired devices and unused tokens (#3), refreshed when the Agents view opens.
@@ -50,6 +56,17 @@ final class Core: ObservableObject {
         var st = stat()
         if fstat(fd, &st) == 0, st.st_size > 1 << 20 { ftruncate(fd, 0) }
         return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+    }
+
+    func watchNetwork() {
+        network.pathUpdateHandler = { [weak self] path in
+            guard path.status == .satisfied else { return }
+            DispatchQueue.main.async {
+                guard let self, self.state == .unlocked, self.stale else { return }
+                self.refresh()
+            }
+        }
+        network.start(queue: DispatchQueue(label: "nodwarden.network"))
     }
 
     func start() {
@@ -152,6 +169,7 @@ final class Core: ObservableObject {
                 unlocking = false
                 keyCount = 0
                 stale = false
+                syncing = false
                 clear([.refresh])
                 lockWatchdog?.cancel()
             case "connecting":
@@ -181,7 +199,10 @@ final class Core: ObservableObject {
             case nil: if keyCount == 0 { show("keys_none") } else if notice?.id.hasPrefix("keys_") == true { notice = nil }
             default: show("keys_failed")
             }
+        case "syncing":
+            syncing = true
         case "sync":
+            syncing = false
             stale = !(e["ok"] as? Bool ?? true)
             if stale, let r = e["reason"] as? String {
                 // Offline is the quiet line, not a card; a login problem needs you, so it's a card.

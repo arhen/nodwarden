@@ -56,6 +56,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sigterm?.setEventHandler { NSApp.terminate(nil) }
         sigterm?.resume()
         core.start()
+        core.watchNetwork()
         // Ask for Touch ID once, the first time the listener is ready and locked (not on a timer).
         core.$state
             .first { $0 == .locked }
@@ -174,6 +175,7 @@ func snapshot(to dir: String) {
     page("p3-home-locked", .home) { $0.state = .locked }
     page("p3b-locked-desktop", .home) { $0.state = .locked; $0.show("desktop_unreachable") }
     page("p8-offline-stale", .home) { $0.state = .unlocked; $0.keyCount = 14; $0.stale = true }
+    page("p8a-offline-syncing", .home) { $0.state = .unlocked; $0.keyCount = 14; $0.stale = true; $0.syncing = true }
     page("p8b-no-keys", .home) { $0.state = .unlocked; $0.keyCount = 0; $0.stale = true; $0.show("keys_offline") }
     page("p8c-login", .home) { $0.state = .unlocked; $0.keyCount = 14; $0.stale = true; $0.show("login") }
     page("p4-agents", .agents, agents)
