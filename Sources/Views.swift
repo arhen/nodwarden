@@ -109,6 +109,8 @@ struct IslandView: View {
     static let rearmDelay: TimeInterval = 2
     /// Request whose Touch ID just succeeded; drives the red fill.
     @State private var granted: Int?
+    /// The request whose masked title you clicked to show (Settings → Hide them in requests too).
+    @State private var revealedRequest: Int?
     /// Shown under the buttons when Touch ID can't run (#28); cleared on the next attempt.
     @State private var touchIDProblem: String?
 
@@ -213,6 +215,7 @@ struct IslandView: View {
         .onChange(of: core.token) { _, t in if t != nil, current == nil { withAnimation(springOpen) { pinned = true } } }
         .onChange(of: current?.id) { old, id in
             cancelPrompt()
+            revealedRequest = nil
             shownAt = Date()
             if old != nil, id == nil { clearedAt = Date() }
             // Arm Touch ID by itself only when the island has been empty for a moment. After a
@@ -361,7 +364,8 @@ struct IslandView: View {
                 .font(.system(size: 14, weight: .semibold))
                 .fixedSize()
             if !s.label.isEmpty {
-                Text(s.label)
+                // Hosts and item names: masked here as in the lists (Settings → Hide hosts and names).
+                MaskedText(text: s.label, masked: settings.maskLists)
                     .font(.system(size: 13))
                     .foregroundStyle(.white.opacity(0.6))
                     .lineLimit(1)
@@ -392,9 +396,19 @@ struct IslandView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
                         // user@host: when it doesn't fit, cut the user, never the verified host.
-                        MaskedText(text: r.title, masked: Settings.shared.maskRequests && r.ssh?.purpose != "git signing")
+                        let maskable = Settings.shared.maskRequests && r.ssh?.purpose != "git signing"
+                        MaskedText(text: r.title, masked: maskable && revealedRequest != r.id)
                             .font(.system(size: 15, weight: .semibold)).lineLimit(1)
                             .truncationMode(r.ssh?.purpose == "login" ? .head : .tail)
+                            // Click to check what you're approving; click again to hide.
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                guard maskable else { return }
+                                withAnimation(.easeOut(duration: 0.25)) {
+                                    revealedRequest = revealedRequest == r.id ? nil : r.id
+                                }
+                            }
+                            .help(maskable ? (revealedRequest == r.id ? "Click to hide" : "Click to show") : "")
                         if core.queue.count > 1 {
                             Text("+\(core.queue.count - 1)")
                                 .font(.system(size: 11, weight: .bold))

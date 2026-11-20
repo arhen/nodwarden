@@ -1050,6 +1050,10 @@ struct MaskedText: View {
             }
             .lineLimit(1)
             .fixedSize()
+            // As wide as its text, never wider than the space given: a long masked name is cut.
+            .frame(minWidth: 0, alignment: .leading)
+            .layoutPriority(-1)
+            .clipped()
             .accessibilityLabel("\(text.prefix(MaskedText.keep)), hidden. Click the row to show.")
             .transition(.opacity)
         }
