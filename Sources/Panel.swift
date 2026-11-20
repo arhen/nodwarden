@@ -43,7 +43,9 @@ extension Core {
 
     var stateDetail: String {
         switch state {
-        case .unlocked: return "\(keyCount) SSH keys · \(relayNote ?? "relay connected")"
+        case .unlocked:
+            let keys = keyCount == 1 ? "1 SSH key" : "\(keyCount) SSH keys"
+            return "\(keys) · " + (stale ? "offline copy" : relayNote == nil ? "relay connected" : "relay reconnecting")
         case .locked: return "Agent requests are denied"
         case .starting: return "Starting…"
         case .offline(let why): return why
@@ -68,6 +70,7 @@ struct PanelView: View {
     @State private var createdName: String?
     @State private var creating = false
     @State private var removing = false
+    @State private var refreshing = false
     /// The live Touch ID prompt for a removal; cancelled when you leave the confirm card.
     @State private var prompt: LAContext?
     @State private var problem: String?
@@ -105,7 +108,7 @@ struct PanelView: View {
         }
         .animation(reduceMotion ? .easeOut(duration: 0.15) : springSwap, value: key)
         .onChange(of: core.token) { _, t in if t != nil { creating = false } }
-        .onChange(of: core.lastError) { _, _ in creating = false }
+        .onChange(of: core.notice) { _, n in if n != nil { creating = false } }
     }
 
     func go(_ p: Page) {
@@ -129,7 +132,11 @@ struct PanelView: View {
                         Circle().fill(core.stateColor).frame(width: 7, height: 7)
                             .shadow(color: core.stateColor.opacity(0.8), radius: 4)
                     }
-                    Text(core.stateDetail).font(.system(size: 12)).foregroundStyle(.white.opacity(0.5))
+                    (core.state == .unlocked && core.stale
+                        ? Text("\(core.keyCount == 1 ? "1 SSH key" : "\(core.keyCount) SSH keys") · ")
+                            + Text("offline copy").foregroundColor(Color(red: 1, green: 0.74, blue: 0.3))
+                        : Text(core.stateDetail))
+                        .font(.system(size: 12)).foregroundStyle(.white.opacity(0.5))
                         .lineLimit(1).contentTransition(.interpolate)
                 }
                 Spacer(minLength: 0)
@@ -139,9 +146,13 @@ struct PanelView: View {
                         .transition(.blurSwap())
                 }
             }
-            if let err = core.lastError {
-                // The latest error stays until a later success clears it (#14, #28).
-                Text(err).font(.system(size: 11)).foregroundStyle(.orange.opacity(0.85)).lineLimit(2)
+            if let n = core.notice {
+                // Stays until a later success resolves it, or you dismiss it (#14, #28).
+                NoticeCard(notice: n, busy: core.unlocking || refreshing,
+                           retry: n.retry.map { r in { retry(r) } },
+                           dismiss: { core.notice = nil })
+                    .id(n.id)
+                    .transition(.blurSwap(y: -6))
             }
             if core.state == .locked {
                 Button { core.unlock() } label: {
@@ -162,6 +173,23 @@ struct PanelView: View {
         }
         .animation(reduceMotion ? .easeOut(duration: 0.15) : springSwap, value: core.state)
         .animation(reduceMotion ? .easeOut(duration: 0.15) : springSwap, value: core.windows.map(\.id))
+        .animation(reduceMotion ? .easeOut(duration: 0.15) : springSwap, value: core.notice)
+        .onChange(of: core.keyCount) { _, _ in refreshing = false }
+        .onChange(of: core.stale) { _, _ in refreshing = false }
+    }
+
+    func retry(_ r: Notice.Retry) {
+        switch r {
+        case .unlock:
+            core.notice = nil
+            if core.state == .unlocked { core.lock() }
+            core.unlock()
+        case .refresh:
+            refreshing = true
+            core.refresh()
+            // The answer clears it; this is the cap if none comes.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { refreshing = false }
+        }
     }
 
     /// Windows that cover the same thing for the same program name are one row, "×N".
@@ -429,8 +457,9 @@ struct PanelView: View {
         VStack(alignment: .leading, spacing: 14) {
             subHeader("New agent token", "Give it a name you'll recognise in requests", back: .agents)
             nameField(button: creating ? "Creating…" : "Create", busy: creating, action: create)
-            if let note = core.relayNote {
-                Text("Needs the relay: \(note)").font(.system(size: 11)).foregroundStyle(.orange.opacity(0.85))
+            if core.relayNote != nil {
+                Label("Waiting for the Agent Access relay", systemImage: "antenna.radiowaves.left.and.right.slash")
+                    .font(.system(size: 11)).foregroundStyle(.white.opacity(0.5))
             }
         }
     }
@@ -495,6 +524,56 @@ struct PanelView: View {
 }
 
 // MARK: - Building blocks
+
+/// A problem, worded for people: tinted icon, title, one line of what it means, and Retry when
+/// trying again can help.
+struct NoticeCard: View {
+    let notice: Notice
+    var busy = false
+    var retry: (() -> Void)?
+    var dismiss: () -> Void
+
+    var tint: Color {
+        switch notice.tone {
+        case .info: return .white.opacity(0.75)
+        case .warning: return Color(red: 1, green: 0.74, blue: 0.3)
+        case .error: return Color(red: 1, green: 0.45, blue: 0.42)
+        }
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8, style: .continuous).fill(tint.opacity(0.16))
+                Image(systemName: notice.symbol).font(.system(size: 13, weight: .semibold)).foregroundStyle(tint)
+            }
+            .frame(width: 30, height: 30)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(notice.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                Text(notice.detail).font(.system(size: 11)).foregroundStyle(.white.opacity(0.55))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 6)
+            if let retry {
+                Button(action: retry) {
+                    if busy {
+                        ProgressView().controlSize(.mini).tint(.white).frame(width: 34)
+                    } else {
+                        Text("Retry")
+                    }
+                }
+                .buttonStyle(Pill(.quiet, height: 26))
+                .disabled(busy)
+            } else {
+                XButton(label: "Dismiss", action: dismiss)
+            }
+        }
+        .padding(10)
+        .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(tint.opacity(0.18), lineWidth: 1))
+        .accessibilityElement(children: .combine)
+    }
+}
 
 struct IconButton: View {
     let symbol: String

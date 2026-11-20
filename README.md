@@ -219,6 +219,9 @@ agent stay as they are.
 **Without the relay.** The SSH agent and unlock work offline; only agent credential requests need the
 relay.
 
+**Without your vault server.** NodWarden unlocks from the copy of the vault on this Mac, so SSH keys
+and secrets keep working. The panel marks it as an offline copy until a sync goes through.
+
 **Idle lock.** NodWarden locks after 15 minutes without keyboard or mouse input. Change it with
 `defaults write io.github.nodwarden idleLockMinutes -int 30`, or `0` to turn it off.
 

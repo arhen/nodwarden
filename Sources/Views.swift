@@ -294,6 +294,17 @@ struct IslandView: View {
                 .foregroundStyle(stateColor)
                 .modifier(SymbolSwap())
                 .animation(springSwap, value: lockSymbol)
+                // Something to look at in the panel (a notice, or working from the offline copy).
+                .overlay(alignment: .topTrailing) {
+                    if core.notice != nil || core.stale {
+                        Circle().fill(core.notice?.tone == .error ? Color(red: 1, green: 0.45, blue: 0.42) : Color(red: 1, green: 0.74, blue: 0.3))
+                            .frame(width: 6, height: 6)
+                            .overlay(Circle().stroke(.black, lineWidth: 1.5))
+                            .offset(x: 4, y: -3)
+                            .transition(.scale.combined(with: .opacity))
+                    }
+                }
+                .animation(springSwap, value: core.notice != nil || core.stale)
         }
     }
 

@@ -62,7 +62,10 @@ impl Bw {
     /// Runs `bw <args>` with the session given through stdin. Output is zeroized on drop.
     pub async fn run(&self, session: Option<&SecretString>, args: &[&str]) -> Result<Output, String> {
         let mut cmd = tokio::process::Command::new(&self.node);
-        cmd.arg("-e").arg(LOADER).arg(&self.script).args(args);
+        // With the vault server unreachable, bw leaves one rejected promise unhandled (its
+        // server-config fetch). Node's default for that is to exit before bw prints anything,
+        // so even `list items` from the local copy fails. As a warning, bw works offline.
+        cmd.arg("--unhandled-rejections=warn").arg("-e").arg(LOADER).arg(&self.script).args(args);
         cmd.env_remove("BW_SESSION")
             .env("BW_NOINTERACTION", "true")
             .stdin(Stdio::piped())
@@ -108,6 +111,21 @@ impl Bw {
             }
         }
         false
+    }
+}
+
+/// What a failed `bw` run means, read from its stderr: "login", "offline" or "failed". Only
+/// this code reaches the panel, which words it; the raw text goes to the log.
+pub fn reason(stderr: &str) -> &'static str {
+    let s = stderr.to_ascii_lowercase();
+    let any = |words: &[&str]| words.iter().any(|w| s.contains(w));
+    if any(&["invalid_grant", "not logged in", "unauthenticated", "statuscode: 401", "status: 401"]) {
+        "login"
+    } else if any(&["unable to fetch", "econnrefused", "enotfound", "etimedout", "econnreset", "eai_again",
+                    "fetch failed", "network", "statuscode: 5", "status: 5"]) {
+        "offline"
+    } else {
+        "failed"
     }
 }
 
@@ -358,6 +376,16 @@ mod tests {
         std::fs::write(&bw, [0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00, 0x00, 0x01]).unwrap();
         let err = Bw::from_paths(&node, &bw).unwrap_err();
         assert!(err.contains("not the Node.js build"), "{err}");
+    }
+
+    #[test]
+    fn failures_are_told_apart() {
+        let tunnel = "Unable to fetch ServerConfig from https://vault.example/api ErrorResponse {\n  status: 530,\n  statusCode: 530";
+        assert_eq!(reason(tunnel), "offline");
+        assert_eq!(reason("request to https://vault.example failed, reason: getaddrinfo ENOTFOUND vault.example"), "offline");
+        assert_eq!(reason("Error: invalid_grant"), "login");
+        assert_eq!(reason("You are not logged in."), "login");
+        assert_eq!(reason("Unexpected token in JSON"), "failed");
     }
 
     #[tokio::test]

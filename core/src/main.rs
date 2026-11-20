@@ -18,11 +18,16 @@
 //!          {"ev":"token","token":..}                      reusable PSK, once, when minted
 //!          {"ev":"windows","items":[{"id","kind","title","sub","secs","total"}]}   open Allow windows (#5)
 //!          {"ev":"agents","paired":[{"id","name","paired","seen"}],"tokens":[{"id","name","created"}]}
-//!          {"ev":"keys","count":N}                        SSH keys loaded
+//!          {"ev":"keys","count":N,"problem":code?}        SSH keys loaded, or why none could be
+//!          {"ev":"sync","ok":bool,"reason":code?}         vault sync result; codes: offline, login,
+//!                                                         timeout, failed (the panel words them)
+//!   stdin  {"op":"refresh"}                               sync again and reload the SSH keys
 //!          {"ev":"request","id":N,"name":..,"domain":..,"username":..,"device":..,"kind":..,"has_totp":..}
 //!          {"ev":"ssh_request","id":N,...}                see ssh_agent::ask_json
 //!          {"ev":"resolved","id":N,"outcome":"approved"|"denied"|"auto"|"expired"|"not_found"|"locked"|"cancelled"}
-//!          {"ev":"log","msg":..}
+//!          {"ev":"notice","code":..}                      something the user should know; the
+//!                                                         panel words each code
+//! Diagnostics go to stderr (the log file), never to the panel as raw text.
 //! Vault secrets never go to stdout. The vault session never goes into any child's argv or env.
 
 mod bw;
@@ -78,6 +83,8 @@ enum Cmd {
     RemoveToken { id: String },
     /// Forget every paired device and token (#3).
     RevokeAll,
+    /// Sync the vault and reload the SSH keys (the panel's Retry).
+    Refresh,
     /// Rename a device (and the token it pairs with) or a token. Empty means unnamed.
     RenameDevice { id: String, name: String },
     RenameToken { id: String, name: String },
@@ -121,10 +128,14 @@ fn emit(v: Value) {
     println!("{v}");
 }
 
-/// A message for the status panel. `level` is "info" or "error"; the UI keeps the last
-/// error visible until a later success replaces it (#14).
+/// A line for the log file (aac-core's stderr). Never shown in the panel as is.
 fn log(level: &str, msg: impl Into<String>) {
-    emit(json!({"ev":"log","level":level,"msg":msg.into()}));
+    eprintln!("nodwarden {level}: {}", msg.into());
+}
+
+/// Tells the panel something happened; it shows its own wording for `code`.
+fn notice(code: &str) {
+    emit(json!({"ev":"notice","code":code}));
 }
 
 fn deny_reply() -> CredentialRequestReply {
@@ -280,6 +291,35 @@ fn record_use(psk_id: String, device: &IdentityFingerprint) {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     m.insert(psk_id, json!({"last": now, "device": hex::encode(device.0)}));
     write_usage(&m);
+}
+
+async fn load_keys_logged(bw: &Bw, session: &SecretString) -> Result<Vec<ssh_agent::Key>, &'static str> {
+    match ssh_agent::load_keys(bw, session).await {
+        Ok(k) => {
+            log("info", format!("ssh agent: {} keys", k.len()));
+            Ok(k)
+        }
+        Err((code, e)) => {
+            log("info", format!("ssh agent: {e}"));
+            Err(code)
+        }
+    }
+}
+
+/// Syncs the vault, then reads the SSH keys again: from the new data, or from the copy on this
+/// Mac when the server can't be reached. Both results go to the panel (#30).
+async fn sync_and_reload(bw: &Bw, session: &SecretString, epoch: u64, tx: &mpsc::Sender<Done>) {
+    let sync = match tokio::time::timeout(Duration::from_secs(10), bw.run(Some(session), &["sync"])).await {
+        Ok(Ok(o)) if o.ok => None,
+        Ok(Ok(o)) => Some(bw::reason(&o.stderr)),
+        Ok(Err(e)) if !e.contains("timed out") => Some("failed"),
+        _ => Some("timeout"),
+    };
+    if let Some(r) = sync {
+        log("info", format!("bw sync failed ({r}); using the copy on this Mac"));
+    }
+    let keys = load_keys_logged(bw, session).await;
+    let _ = tx.send(Done::Synced { epoch, sync, keys }).await;
 }
 
 /// A credential window's id, stable while it is open.
@@ -485,10 +525,12 @@ async fn main() {
 
 /// Results of work that runs off the main loop (#13). `epoch` is `Core::epoch` when the work started.
 enum Done {
-    Unlocked { epoch: u64, session: SecretString, keys: Vec<ssh_agent::Key> },
-    UnlockFailed(String),
-    /// The background `bw sync` after an unlock changed something: reload the SSH keys (#12).
-    Synced { epoch: u64, keys: Vec<ssh_agent::Key> },
+    /// `keys`: the SSH keys, or a reason code when none could be read.
+    Unlocked { epoch: u64, session: SecretString, keys: Result<Vec<ssh_agent::Key>, &'static str> },
+    /// A notice code.
+    UnlockFailed(&'static str),
+    /// A vault sync finished (`sync`: None, or a reason code) and the keys were read again (#12).
+    Synced { epoch: u64, sync: Option<&'static str>, keys: Result<Vec<ssh_agent::Key>, &'static str> },
     Looked { epoch: u64, id: u64, identity: IdentityFingerprint, query_key: String, kind: &'static str,
              reply: oneshot::Sender<CredentialRequestReply>, result: Lookup },
     Released { epoch: u64, id: u64, reply: oneshot::Sender<CredentialRequestReply>, cred: Option<CredentialData>,
@@ -530,6 +572,7 @@ fn spawn_locker(bw: Bw) -> mpsc::Sender<()> {
         while rx.recv().await.is_some() {
             if !bw.lock().await {
                 log("error", "bw lock failed: a copied vault session may still work");
+                notice("lock_failed");
             }
         }
     });
@@ -566,7 +609,7 @@ impl Core {
 
     /// The one way to lock (#6): forget the session, keys and approvals, deny everything waiting,
     /// and lock bw so a session copied earlier stops working.
-    async fn lock_all(&mut self, detail: &str) {
+    async fn lock_all(&mut self, why: Option<&str>) {
         self.epoch += 1;
         self.session = None;
         self.approvals.clear();
@@ -581,7 +624,10 @@ impl Core {
         }
         let _ = self.locker.try_send(());
         emit(json!({"ev":"windows","items":[]}));
-        emit(json!({"ev":"status","state":"locked","detail":detail}));
+        emit(json!({"ev":"status","state":"locked"}));
+        if let Some(code) = why {
+            notice(code);
+        }
     }
 
     /// Labels for paired devices, read once and reread only when the file changes (#13).
@@ -651,33 +697,24 @@ impl Core {
                 let session = SecretString::from(session.as_str().to_owned());
                 tokio::spawn(async move {
                     if bw.status(Some(&session)).await.as_deref() != Some("unlocked") {
-                        let _ = tx.send(Done::UnlockFailed("session rejected".into())).await;
+                        let _ = tx.send(Done::UnlockFailed("session_rejected")).await;
                         return;
                     }
-                    let keys = match ssh_agent::load_keys(&bw, &session).await {
-                        Ok(k) => k,
-                        Err(e) => {
-                            log("error", format!("ssh agent: {e}"));
-                            Vec::new()
-                        }
-                    };
-                    let before = keys.len();
-                    // Unlocked now; the sync runs after, so unlock doesn't wait on the network (#12).
+                    // Unlocked even when the keys can't be read, so credential requests still work;
+                    // the panel says why there are no keys. Read from the copy on this Mac first,
+                    // so unlock doesn't wait on the network (#12).
+                    let keys = load_keys_logged(&bw, &session).await;
                     let _ = tx.send(Done::Unlocked { epoch, session: session.clone(), keys }).await;
-                    // Pick up items added elsewhere (#30). A failed sync (offline) is not fatal.
-                    let synced = tokio::time::timeout(Duration::from_secs(10), bw.run(Some(&session), &["sync"])).await;
-                    if !matches!(synced, Ok(Ok(ref o)) if o.ok) {
-                        log("error", "bw sync failed; using the local copy of the vault");
-                        return;
-                    }
-                    if let Ok(keys) = ssh_agent::load_keys(&bw, &session).await
-                        && keys.len() != before
-                    {
-                        let _ = tx.send(Done::Synced { epoch, keys }).await;
-                    }
+                    sync_and_reload(&bw, &session, epoch, &tx).await;
                 });
             }
-            Cmd::Lock => self.lock_all("").await,
+            Cmd::Refresh => {
+                if let Some(session) = self.session.clone() {
+                    let (bw, tx, epoch) = (self.bw.clone(), self.done_tx.clone(), self.epoch);
+                    tokio::spawn(async move { sync_and_reload(&bw, &session, epoch, &tx).await });
+                }
+            }
+            Cmd::Lock => self.lock_all(None).await,
             // Handled in run(): it needs the relay client.
             Cmd::NewToken { .. } => {}
             Cmd::EndWindows { ids } => {
@@ -726,22 +763,34 @@ impl Core {
                 log("info", "unlock finished after a lock; ignored");
             }
             Done::Unlocked { session, keys, .. } => {
-                log("info", format!("ssh agent: {} keys", keys.len()));
-                emit(json!({"ev":"keys","count":keys.len()}));
+                let keys = keys.map_err(|c| emit(json!({"ev":"keys","count":0,"problem":c}))).unwrap_or_default();
+                if !keys.is_empty() {
+                    emit(json!({"ev":"keys","count":keys.len()}));
+                }
                 self.ssh_state.lock().await.keys = keys;
                 self.session = Some(session);
                 emit(json!({"ev":"status","state":"unlocked"}));
             }
-            Done::Synced { epoch, keys } => {
-                if epoch == self.epoch && self.session.is_some() {
-                    log("info", format!("ssh agent: {} keys after sync", keys.len()));
-                    emit(json!({"ev":"keys","count":keys.len()}));
-                    self.ssh_state.lock().await.keys = keys;
+            Done::Synced { epoch, sync, keys } => {
+                if epoch != self.epoch || self.session.is_none() {
+                    return;
+                }
+                emit(json!({"ev":"sync","ok":sync.is_none(),"reason":sync}));
+                let mut st = self.ssh_state.lock().await;
+                match keys {
+                    Ok(k) => {
+                        emit(json!({"ev":"keys","count":k.len()}));
+                        st.keys = k;
+                    }
+                    // Keep keys already loaded; report only when there are none.
+                    Err(c) if st.keys.is_empty() => emit(json!({"ev":"keys","count":0,"problem":c})),
+                    Err(_) => {}
                 }
             }
-            Done::UnlockFailed(why) => {
+            Done::UnlockFailed(code) => {
                 if self.session.is_none() {
-                    emit(json!({"ev":"status","state":"locked","detail":why}));
+                    emit(json!({"ev":"status","state":"locked"}));
+                    notice(code);
                 }
             }
             Done::Looked { epoch, id, identity, query_key, kind, reply, result } => {
@@ -762,7 +811,7 @@ impl Core {
                     Lookup::Locked => {
                         let _ = reply.send(deny_reply());
                         emit(json!({"ev":"resolved","id":id,"outcome":"locked","query":query_key}));
-                        self.lock_all("vault locked").await;
+                        self.lock_all(Some("bw_locked")).await;
                         return;
                     }
                     Lookup::NotFound(why) => {
@@ -828,6 +877,7 @@ impl Core {
         if waiting >= MAX_PENDING_PER_DEVICE {
             let _ = reply.send(deny_reply());
             log("error", "too many waiting requests from one device; denied");
+            notice("flood");
             return;
         }
         *self.looking.entry(identity).or_default() += 1;
@@ -907,7 +957,7 @@ async fn run() -> Result<(), String> {
                             break;
                         }
                     }
-                    Err(_) => log("error", "bad command"),
+                    Err(_) => log("info", "bad command"),
                 }
             }
             // Parent went away (quit, crash, force quit): lock bw so a copied session stops
@@ -927,6 +977,7 @@ async fn run() -> Result<(), String> {
         tokio::spawn(async move {
             if let Err(e) = ssh_agent::serve(st, ssh_tx).await {
                 log("error", format!("ssh agent: {e}"));
+                notice("agent_failed");
             }
         });
     }
@@ -962,8 +1013,14 @@ async fn run() -> Result<(), String> {
                     tighten_access_protocol_perms();
                     emit_agents().await;
                 }
-                Ok(Err(e)) => log("error", format!("new token failed: {e}")),
-                Err(_) => log("error", "new token timed out; is the relay reachable?"),
+                Ok(Err(e)) => {
+                    log("error", format!("new token failed: {e}"));
+                    notice("token_failed");
+                }
+                Err(_) => {
+                    log("error", "new token timed out");
+                    notice("token_failed");
+                }
             }
         });
     };
@@ -975,7 +1032,7 @@ async fn run() -> Result<(), String> {
             Some(cmd) = cmd_rx.recv() => match cmd {
                 Cmd::NewToken { name } => match &client {
                     Some(c) if relay_up => mint(c.clone(), name),
-                    _ => log("error", "new token needs the relay; try again when connected"),
+                    _ => notice("token_relay"),
                 },
                 cmd if cmd.edits_pairings() => {
                     // ap-client keeps tokens and devices in memory and has no command to drop one,
@@ -994,6 +1051,7 @@ async fn run() -> Result<(), String> {
                     core.report_windows().await;
                     if let Err(e) = edit_pairings(&cmd).await {
                         log("error", format!("could not update pairings: {e}"));
+                        notice("pairings_failed");
                     }
                     emit_agents().await;
                     retired = Arc::new(AtomicBool::new(false));
@@ -1017,7 +1075,10 @@ async fn run() -> Result<(), String> {
                     requests = Some(h.requests);
                     emit(json!({"ev":"status","state":"listening"}));
                 }
-                Err(e) => log("error", e),
+                Err(e) => {
+                    log("error", format!("pairing files: {e}"));
+                    notice("pairings_failed");
+                }
             },
 
             Some(req) = async { requests.as_mut()?.recv().await }, if requests.is_some() => match req {
@@ -1025,6 +1086,7 @@ async fn run() -> Result<(), String> {
                     // Only rendezvous pairing asks this; we only accept PSK pairing.
                     let _ = reply.send(FingerprintVerificationReply { approved: false, name: None });
                     log("error", "rejected rendezvous pairing (PSK only)");
+                    notice("rendezvous_refused");
                 }
                 UserClientRequest::CredentialRequest { query, identity, reply } =>
                     core.on_credential_request(query, identity, reply),
@@ -1048,7 +1110,7 @@ async fn run() -> Result<(), String> {
                     relay_up = true;
                     emit(json!({"ev":"status","state":"listening"}));
                 }
-                UserClientNotification::Error { message, .. } => log("error", message),
+                UserClientNotification::Error { message, .. } => log("info", format!("relay: {message}")),
                 _ => {}
             },
 
@@ -1165,11 +1227,11 @@ mod tests {
         // The screen locks while `bw status` / `bw list items` of the unlock are still running.
         core.on_cmd(Cmd::Lock).await;
         assert!(locks.try_recv().is_ok(), "bw lock was not requested");
-        core.on_done(Done::Unlocked { epoch: started, session: session(), keys: Vec::new() }).await;
+        core.on_done(Done::Unlocked { epoch: started, session: session(), keys: Ok(Vec::new()) }).await;
         assert!(core.session.is_none(), "a lock must win over an unlock in flight");
 
         // An unlock started after the lock is accepted.
-        core.on_done(Done::Unlocked { epoch: core.epoch, session: session(), keys: Vec::new() }).await;
+        core.on_done(Done::Unlocked { epoch: core.epoch, session: session(), keys: Ok(Vec::new()) }).await;
         assert!(core.session.is_some());
     }
 
@@ -1179,7 +1241,7 @@ mod tests {
         core.session = Some(session());
         let started = core.epoch;
         let (tx, rx) = oneshot::channel();
-        core.lock_all("").await;
+        core.lock_all(None).await;
         core.on_done(Done::Released { epoch: started, id: 1, reply: tx, cred: Some(credential()), auto: false, domain: None }).await;
         let reply = rx.await.unwrap();
         assert!(!reply.approved && reply.credential.is_none());
@@ -1292,7 +1354,7 @@ mod tests {
         let info = ItemInfo { id: "item-1".into(), name: "GitHub".into(), username: None, uri: None, domain: None, has_totp: false };
         core.pending.insert(1, (Pending { identity: device, item_id: "item-1".into(), reply: tx, deadline: Instant::now() + REQUEST_TIMEOUT }, info));
         core.approvals.insert((device, "item-1".into()), (Instant::now() + Duration::from_secs(600), 600, "GitHub".into()));
-        core.lock_all("").await;
+        core.lock_all(None).await;
         assert!(!rx.await.unwrap().approved);
         assert!(core.session.is_none() && core.pending.is_empty() && core.approvals.is_empty());
 

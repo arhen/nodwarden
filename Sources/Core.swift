@@ -8,10 +8,11 @@ final class Core: ObservableObject {
     @Published var queue: [CredRequest] = []
     @Published var outcome: Outcome?
     @Published var unlocking = false
-    /// Last few log lines from aac-core (#19).
-    @Published var log: [String] = []
-    /// The latest error, shown in the status panel until a later success clears it (#14).
-    @Published var lastError: String?
+    /// The latest thing to tell you, shown as a card until it's resolved or replaced (#14).
+    @Published var notice: Notice?
+    /// The vault couldn't be synced: the keys come from the copy on this Mac. Shown as a quiet
+    /// line, and a dot on the island, until a sync works.
+    @Published var stale = false
     /// Open Allow windows, as the core reports them (#5): what each covers and when it ends.
     @Published var windows: [AllowWindow] = []
     /// Paired devices and unused tokens (#3), refreshed when the Agents view opens.
@@ -144,14 +145,15 @@ final class Core: ObservableObject {
             case "unlocked":
                 state = .unlocked
                 unlocking = false
-                lastError = nil // an unlock that worked replaces any earlier failure
+                clear([.unlock])
                 lockWatchdog?.cancel()
             case "locked":
                 state = .locked
                 unlocking = false
                 keyCount = 0
+                stale = false
+                clear([.refresh])
                 lockWatchdog?.cancel()
-                if let d = e["detail"] as? String, !d.isEmpty { note(.error, d) }
             case "connecting":
                 relayNote = e["detail"] as? String ?? "connecting to relay"
             case "listening":
@@ -173,6 +175,22 @@ final class Core: ObservableObject {
             }
         case "keys":
             keyCount = e["count"] as? Int ?? 0
+            switch e["problem"] as? String {
+            case "offline": show("keys_offline")
+            case "login": show("login")
+            case nil: if keyCount == 0 { show("keys_none") } else if notice?.id.hasPrefix("keys_") == true { notice = nil }
+            default: show("keys_failed")
+            }
+        case "sync":
+            stale = !(e["ok"] as? Bool ?? true)
+            if stale, let r = e["reason"] as? String {
+                // Offline is the quiet line, not a card; a login problem needs you, so it's a card.
+                if r == "login" { show("login") }
+            } else if notice?.retry == .refresh, !(notice?.id.hasPrefix("keys_") ?? false) {
+                notice = nil
+            }
+        case "notice":
+            if let c = e["code"] as? String { show(c) }
         case "agents":
             func date(_ v: Any?) -> Date { Date(timeIntervalSince1970: v as? Double ?? 0) }
             let labels = Dictionary(paired.map { ($0.id, $0.label) }, uniquingKeysWith: { a, _ in a })
@@ -182,8 +200,6 @@ final class Core: ObservableObject {
                 let device = (t["device"] as? String).map { labels[$0] ?? "Unnamed · \($0.prefix(6))" }
                 return Agent(id: id, name: t["name"] as? String, since: date(t["created"]), seen: last, usedBy: device)
             }.sorted { ($0.seen ?? .distantPast, $0.since) > ($1.seen ?? .distantPast, $1.since) }
-        case "log":
-            if let m = e["msg"] as? String { note(e["level"] as? String == "error" ? .error : .info, m) }
         case "request":
             guard let id = e["id"] as? Int else { return }
             let name = e["name"] as? String ?? "item"
@@ -270,7 +286,7 @@ final class Core: ObservableObject {
     func unlock() {
         guard !unlocking else { return }
         guard let node = Tools.node, Tools.bw != nil || Tools.bwbio != nil else {
-            note(.error, "Touch ID unlock needs node and bw or bwbio")
+            show("tools_missing")
             return
         }
         unlocking = true
@@ -278,14 +294,15 @@ final class Core: ObservableObject {
         let candidates = [Tools.bw, Tools.bwbio].compactMap { $0 }
         DispatchQueue.global().async { [weak self] in
             var session: String?
+            var why = "touchid_cancelled"
             for tool in candidates where session == nil {
-                session = Core.touchIDSession(node: node, script: tool)
+                (session, why) = Core.touchIDSession(node: node, script: tool, fallback: why)
             }
             DispatchQueue.main.async {
                 guard let self else { return }
                 guard let session else {
                     self.unlocking = false
-                    self.note(.error, "Touch ID unlock failed or was cancelled")
+                    self.show(why)
                     return
                 }
                 guard started == self.lockCount else {
@@ -307,25 +324,47 @@ final class Core: ObservableObject {
     }
 
     /// Runs `<tool> unlock --raw` with no terminal and a 60 s limit (#18). With no Touch ID
-    /// path, `bw` asks for a password, reads EOF from /dev/null and prints nothing: nil.
-    static func touchIDSession(node: String, script: String) -> String? {
+    /// path, `bw` asks for a password, reads EOF from /dev/null and prints nothing. Returns the
+    /// session, or why there is none as a notice code (`fallback` when stderr says nothing).
+    static func touchIDSession(node: String, script: String, fallback: String) -> (String?, String) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: node)
-        p.arguments = [script, "unlock", "--raw"]
+        p.arguments = ["--unhandled-rejections=warn", script, "unlock", "--raw"]
         p.environment = ["HOME": NSHomeDirectory(), "PATH": Tools.childPath]
-        let out = Pipe()
+        let out = Pipe(), err = Pipe()
         p.standardInput = FileHandle.nullDevice
         p.standardOutput = out
-        p.standardError = FileHandle.nullDevice
-        guard (try? p.run()) != nil else { return nil }
+        p.standardError = err
+        guard (try? p.run()) != nil else { return (nil, fallback) }
         let killer = DispatchWorkItem { if p.isRunning { p.terminate() } }
         DispatchQueue.global().asyncAfter(deadline: .now() + 60, execute: killer)
+        var errData = Data()
+        let errDone = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            errData = err.fileHandleForReading.readDataToEndOfFile()
+            errDone.signal()
+        }
         let data = out.fileHandleForReading.readDataToEndOfFile()
+        errDone.wait()
         p.waitUntilExit()
         killer.cancel()
         let s = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         // A bw session key is 64 random bytes, base64: 88 characters.
-        return s.count == 88 && Data(base64Encoded: s) != nil ? s : nil
+        if s.count == 88 && Data(base64Encoded: s) != nil { return (s, fallback) }
+        return (nil, unlockFailure(String(decoding: errData, as: UTF8.self), fallback: fallback))
+    }
+
+    /// Why an unlock gave no session, from the tool's stderr. Only the code leaves here.
+    static func unlockFailure(_ stderr: String, fallback: String) -> String {
+        let s = stderr.lowercased()
+        let any = { (w: [String]) in w.contains { s.contains($0) } }
+        if any(["failed to connect to desktop", "not connected to desktop", "disconnected from desktop",
+                "timed out waiting for desktop", "connection to desktop app timed out", "notenabledinconnecteddesktopapp"]) {
+            return "desktop_unreachable"
+        }
+        if any(["no user id available", "account mismatch", "not logged in", "invalid_grant"]) { return "login" }
+        if any(["denied or failed", "cancel"]) { return "touchid_cancelled" }
+        return fallback
     }
 
     /// Counts locks, so an unlock that was still waiting when the Mac locked is dropped.
@@ -340,7 +379,7 @@ final class Core: ObservableObject {
             guard let self, self.state == .unlocked else { return }
             // The core didn't confirm within 3 s: it's stuck. The session and keys live only in
             // its memory, so ending it is a lock; then lock bw from here too.
-            self.note(.error, "core did not confirm the lock; restarting it")
+            self.show("core_restarted")
             self.proc?.terminate()
             self.state = .locked
             DispatchQueue.global().async { Core.bwLock() }
@@ -373,13 +412,16 @@ final class Core: ObservableObject {
         send(["op": device ? "rename_device" : "rename_token", "id": a.id, "name": name])
     }
 
-    enum Level { case info, error }
+    /// One place for what the panel tells you (#23).
+    func show(_ code: String) { notice = Notice.of(code) }
 
-    /// One place for status messages (#23): the short history, and the sticky last error.
-    func note(_ level: Level, _ msg: String) {
-        log = Array((log + [msg]).suffix(5))
-        if level == .error { lastError = msg } else if state == .unlocked { lastError = nil }
+    /// Clears a notice that this success resolves: one whose retry is one of `kinds`.
+    func clear(_ kinds: [Notice.Retry]) {
+        if let r = notice?.retry, kinds.contains(r) { notice = nil }
     }
+
+    /// Sync again and reload the SSH keys.
+    func refresh() { send(["op": "refresh"]) }
 }
 
 // MARK: - Presence check

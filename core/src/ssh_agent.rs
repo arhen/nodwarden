@@ -272,12 +272,15 @@ struct BwSshItem {
 }
 
 /// Loads SSH key items. Other fields of the vault are never deserialized (#9).
-pub async fn load_keys(bw: &Bw, session: &secrecy::SecretString) -> Result<Vec<Key>, String> {
-    let out = bw.run(Some(session), &["list", "items"]).await?;
+/// The SSH keys in the vault. On failure: (reason code for the panel, text for the log).
+pub async fn load_keys(bw: &Bw, session: &secrecy::SecretString) -> Result<Vec<Key>, (&'static str, String)> {
+    let out = bw.run(Some(session), &["list", "items"]).await
+        .map_err(|e| (if e.contains("timed out") { "timeout" } else { "failed" }, e))?;
     if !out.ok {
-        return Err("bw list items failed".into());
+        let why = out.stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("no output").trim();
+        return Err((crate::bw::reason(&out.stderr), format!("bw list items failed: {}", why.chars().take(120).collect::<String>())));
     }
-    let items: Vec<BwSshItem> = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+    let items: Vec<BwSshItem> = serde_json::from_slice(&out.stdout).map_err(|e| ("failed", e.to_string()))?;
     let mut keys = Vec::new();
     for it in items {
         let Some(pem) = it.ssh_key.and_then(|k| k.private_key) else { continue };

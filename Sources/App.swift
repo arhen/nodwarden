@@ -172,7 +172,10 @@ func snapshot(to dir: String) {
                       AllowWindow(id: "d", kind: "login", title: "root@203.0.113.7", sub: "Server Key · fish", until: now.addingTimeInterval(240), total: 600)]
     }
     page("p3-home-locked", .home) { $0.state = .locked }
-    page("p3b-home-locked-error", .home) { $0.state = .locked; $0.lastError = "Touch ID unlock failed or was cancelled" }
+    page("p3b-locked-desktop", .home) { $0.state = .locked; $0.show("desktop_unreachable") }
+    page("p8-offline-stale", .home) { $0.state = .unlocked; $0.keyCount = 14; $0.stale = true }
+    page("p8b-no-keys", .home) { $0.state = .unlocked; $0.keyCount = 0; $0.stale = true; $0.show("keys_offline") }
+    page("p8c-login", .home) { $0.state = .unlocked; $0.keyCount = 14; $0.stale = true; $0.show("login") }
     page("p4-agents", .agents, agents)
     page("p4b-agents-empty", .agents) { $0.state = .unlocked }
     page("p5-confirm-device", .confirm(.device(Agent(id: "9b21de4400", name: nil, since: now))), agents)
@@ -215,7 +218,9 @@ func snapshot(to dir: String) {
                       AllowWindow(id: "c", kind: "login", title: "git@github.com", sub: "Github Key · zsh", until: Date().addingTimeInterval(1200), total: 3600),
                       AllowWindow(id: "d", kind: "login", title: "root@203.0.113.7", sub: "Server Key · fish", until: Date().addingTimeInterval(240), total: 600)]
     }
-    shot("7c-locked-error", false, true) { $0.state = .locked; $0.lastError = "Touch ID unlock failed or was cancelled" }
+    shot("7c-locked-error", false, true) { $0.state = .locked; $0.show("touchid_cancelled") }
+    shot("1c-idle-stale") { $0.state = .unlocked; $0.keyCount = 14; $0.stale = true }
+    shot("1d-idle-nokeys") { $0.state = .unlocked; $0.keyCount = 0; $0.show("keys_offline") }
     shot("8-unlocking") { $0.state = .locked; $0.unlocking = true }
     shot("9-offline") { $0.state = .offline("relay: connection refused") }
     shot("9b-relay-down", false, true) { $0.state = .unlocked; $0.relayNote = "relay disconnected, reconnecting" }
