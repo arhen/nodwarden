@@ -9,6 +9,9 @@ final class Core: ObservableObject {
     @Published var queue: [CredRequest] = []
     @Published var outcome: Outcome?
     @Published var unlocking = false
+    /// Touch ID went through; the vault is opening (reading the SSH keys). Shown at once, so
+    /// the touch gets an answer before the slow part is done.
+    @Published var opening = false
     /// The latest thing to tell you, shown as a card until it's resolved or replaced (#14).
     @Published var notice: Notice?
     /// The vault couldn't be synced: the keys come from the copy on this Mac. Shown as a quiet
@@ -109,6 +112,7 @@ final class Core: ObservableObject {
         do { try p.run() } catch { state = .offline("cannot start aac-core"); return }
         proc = p
         stdin = inPipe.fileHandleForWriting
+        sendConfig()
     }
 
     func stop() {
@@ -165,11 +169,13 @@ final class Core: ObservableObject {
             case "unlocked":
                 state = .unlocked
                 unlocking = false
+                opening = false
                 clear([.unlock])
                 lockWatchdog?.cancel()
             case "locked":
                 state = .locked
                 unlocking = false
+                opening = false
                 keyCount = 0
                 stale = false
                 syncing = false
@@ -274,6 +280,7 @@ final class Core: ObservableObject {
             case "not_found": flash(.notFound(label))
             case "locked": flash(.locked(label))
             case "cancelled": flash(.cancelled(label))
+            case "offline": flash(.offline(label))
             default: break
             }
         default: break
@@ -283,6 +290,7 @@ final class Core: ObservableObject {
     /// Adds a finished request to the history. Back-to-back repeats of what happened without
     /// you (auto, locked) for the same target fold into one row; your own answers never do.
     private func record(id: Int, outcome: String?, shown: CredRequest?, about: [String: Any]?) {
+        guard Settings.shared.keepHistory else { return }
         let result: HistoryEntry.Result
         switch outcome {
         case "approved": result = .allowed
@@ -292,6 +300,7 @@ final class Core: ObservableObject {
         case "cancelled": result = .cancelled
         case "not_found": result = .notFound
         case "locked": result = .locked
+        case "offline": result = .offline
         default: return
         }
         let kind: String, title: String, sub: String
@@ -311,7 +320,7 @@ final class Core: ObservableObject {
         } else {
             return
         }
-        if [.auto, .locked].contains(result), var last = history.first,
+        if [.auto, .locked, .offline].contains(result), var last = history.first,
            last.result == result, last.kind == kind, last.title == title, last.sub == sub {
             last.count += 1
             last.at = Date()
@@ -331,6 +340,7 @@ final class Core: ObservableObject {
     /// Haptic plus a short system sound; `NSSound.play()` is asynchronous.
     private func announceArrival() {
         NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+        guard Settings.shared.sound else { return }
         arrivalSound?.stop()
         arrivalSound?.play()
     }
@@ -359,12 +369,17 @@ final class Core: ObservableObject {
         }
         unlocking = true
         let started = lockCount
+        // The tool that gave a session last time goes first: on a server where the official
+        // `bw` has no Touch ID path, trying it first costs a second and a half for nothing.
+        let last = UserDefaults.standard.string(forKey: "unlockTool")
         let candidates = [Tools.bw, Tools.bwbio].compactMap { $0 }
+            .sorted { a, _ in a == last }
         DispatchQueue.global().async { [weak self] in
             var session: String?
             var why = "touchid_cancelled"
             for tool in candidates where session == nil {
                 (session, why) = Core.touchIDSession(node: node, script: tool, fallback: why)
+                if session != nil { UserDefaults.standard.set(tool, forKey: "unlockTool") }
             }
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -381,6 +396,7 @@ final class Core: ObservableObject {
                     return
                 }
                 self.send(["op": "unlock", "session": session])
+                self.opening = true
                 // The core still runs `bw status` and loads the keys; stay "unlocking" until it
                 // answers, so the button can't raise a second Bitwarden prompt meanwhile (#12).
                 DispatchQueue.main.asyncAfter(deadline: .now() + 45) { [weak self] in
@@ -486,6 +502,11 @@ final class Core: ObservableObject {
     /// Clears a notice that this success resolves: one whose retry is one of `kinds`.
     func clear(_ kinds: [Notice.Retry]) {
         if let r = notice?.retry, kinds.contains(r) { notice = nil }
+    }
+
+    /// Settings the core enforces; sent at start and whenever one changes.
+    func sendConfig() {
+        send(["op": "config", "offline_ok": Settings.shared.offlineCopy])
     }
 
     /// Sync again and reload the SSH keys.

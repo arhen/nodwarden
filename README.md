@@ -191,7 +191,8 @@ same commit as `aac` 0.11.0. It uses the same `~/.access-protocol` pairing files
 open ~/Applications/NodWarden.app
 ```
 
-To start it at login, add `~/Applications/NodWarden.app` to System Settings → General → Login Items.
+To start it at login, turn on **Open at login** in its Settings (click the island, ⚙ → Settings). If
+macOS asks, allow it in System Settings → General → Login Items.
 
 If `bw`/`bwbio`/`node` live somewhere unusual, set `NODWARDEN_PATH` to a PATH string.
 `~/Applications/NodWarden.app/Contents/MacOS/nodwarden --tools` prints which ones NodWarden will run.
@@ -220,6 +221,11 @@ agent stay as they are.
 what happened (allowed, auto, denied, timed out). It is kept in memory only and cleared when NodWarden
 quits. Hosts, item names and usernames there and in the Allow list are hidden under a spoiler until you
 click them, so a screenshot or screen recording of the notch doesn't show them.
+
+**Settings.** ⚙ → Settings: hiding hosts and names (in lists, and optionally in requests), keeping
+history, idle lock (Never to 1 hour), locking on sleep, offering Allow-for-N-minutes, starting Touch ID
+by itself, the sound, working from the offline copy, and opening at login. No setting can skip Touch
+ID: at most it hides more or asks more often.
 
 **Without the relay.** The SSH agent and unlock work offline; only agent credential requests need the
 relay.

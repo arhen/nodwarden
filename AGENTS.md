@@ -11,7 +11,8 @@
 
 - `cd core && cargo test --release && cargo clippy --release --all-targets` (0 warnings).
 - `swiftc -typecheck -swift-version 5 -parse-as-library -target arm64-apple-macos14.0 Sources/*.swift`
-- `./build.sh`, then `launchctl kickstart -k gui/$(id -u)/dev.arhen.nodwarden`.
+- `./build.sh`, then restart the app: `pkill -x nodwarden; open ~/Applications/NodWarden.app`.
+  It starts at login through macOS Login Items (Settings → Open at login), not a LaunchAgent.
 - Check `git show --stat HEAD` before pushing: the commit should hold only the files you meant
   to change.
 - No personal data in the repo. Known limits go to GitHub issues, not the README.

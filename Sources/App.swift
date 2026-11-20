@@ -44,7 +44,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Writing to a dead aac-core pipe must not kill the app (#8).
         signal(SIGPIPE, SIG_IGN)
         // Lock when the Mac sleeps or the screen locks, so no Allow window survives you walking away (#6).
-        let lockNow: (Notification) -> Void = { [weak self] _ in self?.core.lock() }
+        let lockNow: (Notification) -> Void = { [weak self] _ in
+            if Settings.shared.lockOnSleep { self?.core.lock() }
+        }
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main, using: lockNow)
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main, using: lockNow)
         DistributedNotificationCenter.default().addObserver(forName: .init("com.apple.screenIsLocked"), object: nil, queue: .main, using: lockNow)
@@ -56,6 +58,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sigterm?.setEventHandler { NSApp.terminate(nil) }
         sigterm?.resume()
         core.start()
+        Settings.shared.$offlineCopy.dropFirst().receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.core.sendConfig() }.store(in: &cancellables)
+        Settings.shared.$offerWindows.dropFirst().filter { !$0 }.receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.core.endWindows() }.store(in: &cancellables)
+        Settings.shared.$keepHistory.dropFirst().filter { !$0 }.receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.core.history.removeAll() }.store(in: &cancellables)
         core.watchNetwork()
         // Ask for Touch ID once, the first time the listener is ready and locked (not on a timer).
         core.$state
@@ -66,12 +74,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Locks after this many minutes with no keyboard or mouse input (#26), so no vault session
-    /// or Allow window outlives you walking away with the screen on. `defaults write
-    /// io.github.nodwarden idleLockMinutes -int N` changes it; 0 turns it off.
-    var idleLockMinutes: Double {
-        let v = UserDefaults.standard.object(forKey: "idleLockMinutes") as? Double
-        return v ?? 15
-    }
+    /// or Allow window outlives you walking away with the screen on. Settings → Lock when idle;
+    /// 0 is never.
+    var idleLockMinutes: Double { Double(Settings.shared.idleLockMinutes) }
     var idleTimer: Timer?
     func startIdleLock() {
         let t = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
@@ -138,7 +143,7 @@ func snapshot(to dir: String) {
     func page(_ name: String, _ p: Page, _ setup: (Core) -> Void) {
         let core = Core()
         setup(core)
-        let v = PanelView(core: core, page: .constant(p))
+        let v = PanelView(core: core, page: .constant(p), flat: true)
             .foregroundStyle(.white)
             .padding(.horizontal, 26).padding(.top, 46).padding(.bottom, 22)
             .frame(width: 460)
@@ -194,6 +199,7 @@ func snapshot(to dir: String) {
     ]
     page("p10-history", .history) { $0.state = .unlocked; $0.history = past }
     page("p10b-history-empty", .history) { $0.state = .unlocked }
+    page("p11-settings", .settings) { $0.state = .unlocked }
     page("p5-confirm-device", .confirm(.device(Agent(id: "9b21de4400", name: nil, since: now))), agents)
     page("p5b-confirm-all", .confirm(.all), agents)
     page("p6-new-token", .newToken) { $0.state = .unlocked }
@@ -250,6 +256,16 @@ enum Main {
             MainActor.assumeIsolated { snapshot(to: CommandLine.arguments[i + 1]) }
             return
         }
+        // `nodwarden --login-item [on|off]`: what macOS reports for Open at login, after the change.
+        if let i = CommandLine.arguments.firstIndex(of: "--login-item") {
+            let arg = i + 1 < CommandLine.arguments.count ? CommandLine.arguments[i + 1] : ""
+            if arg == "on" || arg == "off" {
+                let (_, error) = LoginItem.set(arg == "on")
+                if let error { print("error: \(error)") }
+            }
+            print(LoginItem.state)
+            return
+        }
         // `nodwarden --tools`: which node/bw/bwbio would be run, to diagnose a refused path.
         if CommandLine.arguments.contains("--tools") {
             for (name, path) in [("node", Tools.node), ("bw", Tools.bw), ("bwbio", Tools.bwbio)] {
@@ -258,6 +274,10 @@ enum Main {
             print("PATH for children: \(Tools.childPath)")
             return
         }
+        // Started from Login Items rather than launchd, an app with no windows can be quit by
+        // macOS when it looks idle. NodWarden holds the SSH agent: never.
+        ProcessInfo.processInfo.disableAutomaticTermination("NodWarden runs the SSH agent")
+        ProcessInfo.processInfo.disableSuddenTermination()
         let app = NSApplication.shared
         app.delegate = delegate
         app.setActivationPolicy(.accessory)

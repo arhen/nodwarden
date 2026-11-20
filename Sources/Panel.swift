@@ -5,7 +5,7 @@ import SwiftUI
 // MARK: - Status panel: home, Agents, new token. Everything stays inside the notch.
 
 enum Page: Equatable {
-    case home, agents, history, newToken
+    case home, agents, history, settings, newToken
     case confirm(Removal)
     case rename(Agent, device: Bool)
 }
@@ -48,7 +48,9 @@ extension Core {
         case .starting: return (.white.opacity(0.45), "Starting…", nil, nil, false)
         case .offline: return (Tint.bad, "Stopped · restarting…", nil, nil, false)
         // While unlocking the button says "Waiting for Touch ID…"; the dot breathes.
-        case .locked: return (Tint.bad, "Locked", nil, nil, unlocking)
+        case .locked:
+            if opening { return (Tint.ok, "Opening vault…", nil, nil, true) }
+            return (Tint.bad, "Locked", nil, nil, unlocking)
         case .unlocked:
             if notice?.tone == .error { return (Tint.bad, "Needs attention", nil, Tint.bad, false) }
             if stale { return (Tint.warn, "Ready", syncing ? "syncing…" : "offline copy", Tint.warn, false) }
@@ -70,7 +72,11 @@ extension Core {
 
 struct PanelView: View {
     @ObservedObject var core: Core
+    /// Watched so a change in Settings shows at once (masking, history).
+    @ObservedObject private var settings = Settings.shared
     @Binding var page: Page
+    /// Snapshot rendering: draw scrolling lists flat.
+    var flat = false
     @State private var name = ""
     @State private var createdName: String?
     @State private var creating = false
@@ -87,6 +93,7 @@ struct PanelView: View {
         case .home: return "home"
         case .agents: return "agents"
         case .history: return "history"
+        case .settings: return "settings"
         case .newToken: return "new"
         case .confirm: return "confirm"
         case .rename: return "rename"
@@ -103,6 +110,7 @@ struct PanelView: View {
                     case .home: home
                     case .agents: agents
                     case .history: historyPage
+                    case .settings: VStack(alignment: .leading, spacing: 14) { tabsHeader; SettingsPage(core: core, scrolls: !flat) }
                     case .newToken: newToken
                     case .confirm(let r): confirm(r)
                     case .rename(let a, let device): rename(a, device: device)
@@ -179,7 +187,7 @@ struct PanelView: View {
                     HStack(spacing: 8) {
                         Image(systemName: "touchid").font(.system(size: 15, weight: .semibold))
                             .symbolEffect(.pulse, isActive: core.unlocking)
-                        Text(core.unlocking ? "Waiting for Touch ID…" : "Unlock with Touch ID")
+                        Text(core.opening ? "Opening vault…" : core.unlocking ? "Waiting for Touch ID…" : "Unlock with Touch ID")
                     }
                     .frame(maxWidth: .infinity)
                 }
@@ -240,7 +248,7 @@ struct PanelView: View {
             Card {
                 ForEach(Array(groups.enumerated()), id: \.element.id) { i, g in
                     if i > 0 { RowDivider() }
-                    Row(symbol: symbol(g.kind), title: g.title, sub: g.sub, count: g.ids.count, hidden: g.kind == "login" || g.kind == "secret") {
+                    Row(symbol: symbol(g.kind), title: g.title, sub: g.sub, count: g.ids.count, hidden: Settings.shared.maskLists && (g.kind == "login" || g.kind == "secret")) {
                         HStack(spacing: 8) {
                             TimeRing(until: g.until, total: g.total)
                             XButton(label: "End \(g.title)") { core.endWindows(g.ids) }
@@ -350,10 +358,11 @@ struct PanelView: View {
         HStack(spacing: 10) {
             IconButton(symbol: "chevron.left", label: "Back") { go(.home) }
             Spacer(minLength: 0)
-            Segmented(options: ["Agents", "History"], selected: page == .history ? 1 : 0) { i in
-                go(i == 0 ? .agents : .history)
+            Segmented(options: ["Agents", "History", "Settings"],
+                      selected: page == .history ? 1 : page == .settings ? 2 : 0) { i in
+                go([Page.agents, .history, .settings][i])
             }
-            .frame(width: 200)
+            .frame(width: 270)
         }
     }
 
@@ -416,7 +425,8 @@ struct PanelView: View {
                         ForEach(Array(items.enumerated()), id: \.element.id) { i, h in
                             if i > 0 { RowDivider() }
                             Row(symbol: symbol(h.kind), title: h.title, sub: h.sub,
-                                hidden: h.kind == "login" || h.kind == "secret", hiddenSub: h.kind == "secret") {
+                                hidden: Settings.shared.maskLists && (h.kind == "login" || h.kind == "secret"),
+                                hiddenSub: Settings.shared.maskLists && h.kind == "secret") {
                                 VStack(alignment: .trailing, spacing: 3) {
                                     ResultBadge(result: h.result, count: h.count)
                                     Text(h.at, format: .dateTime.hour().minute())
@@ -715,6 +725,7 @@ struct ResultBadge: View {
         case .cancelled: return ("Cancelled", .white.opacity(0.5))
         case .notFound: return ("No match", .white.opacity(0.5))
         case .locked: return (count > 1 ? "Locked ×\(count)" : "Locked", .white.opacity(0.5))
+        case .offline: return (count > 1 ? "Offline ×\(count)" : "Offline", Tint.warn)
         }
     }
     var body: some View {
@@ -1006,6 +1017,11 @@ struct MaskedText: View {
     let text: String
     let masked: Bool
     static let keep = 2
+
+    /// The hint alone, for text that can't draw ink (the Touch ID prompt): "ro••@20•.•.•".
+    static func hint(_ text: String) -> String {
+        String(text.enumerated().map { i, c in i >= keep && (c.isLetter || c.isNumber) ? "•" : c })
+    }
 
     /// Runs of (text, hidden).
     var runs: [(String, Bool)] {

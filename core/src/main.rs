@@ -22,11 +22,13 @@
 //!          {"ev":"sync","ok":bool,"reason":code?}         vault sync result; codes: offline, login,
 //!                                                         timeout, failed (the panel words them)
 //!   stdin  {"op":"refresh"}                               sync now and reload the SSH keys
+//!          {"op":"config","offline_ok":bool}              false: while the last sync failed,
+//!                                                         refuse SSH and secrets ("offline")
 //!          {"ev":"syncing"}                               a sync started (Retry, or the
 //!                                                         automatic retry while offline)
 //!          {"ev":"request","id":N,"name":..,"domain":..,"username":..,"device":..,"kind":..,"has_totp":..}
 //!          {"ev":"ssh_request","id":N,...}                see ssh_agent::ask_json
-//!          {"ev":"resolved","id":N,"outcome":"approved"|"denied"|"auto"|"expired"|"not_found"|"locked"|"cancelled",
+//!          {"ev":"resolved","id":N,"outcome":"approved"|"denied"|"auto"|"expired"|"not_found"|"locked"|"cancelled"|"offline",
 //!           "about":{"kind","title","sub"}?}   about: for requests that never showed a card
 //!           (auto, locked, no match), so the history can name them. Never a secret.
 //!          {"ev":"notice","code":..}                      something the user should know; the
@@ -90,6 +92,8 @@ enum Cmd {
     RemoveToken { id: String },
     /// Forget every paired device and token (#3).
     RevokeAll,
+    /// Settings the core enforces. `offline_ok` false: refuse while working from a stale copy.
+    Config { offline_ok: bool },
     /// Sync the vault and reload the SSH keys (the panel's Retry).
     Refresh,
     /// Rename a device (and the token it pairs with) or a token. Empty means unnamed.
@@ -578,6 +582,10 @@ struct Core {
     retry_sync: Option<(Instant, Duration)>,
     /// A sync is running; never start a second.
     syncing: bool,
+    /// The last sync failed, so the keys and items come from the copy on this Mac.
+    stale: bool,
+    /// Setting: work from that copy. When false, requests are refused while `stale`.
+    offline_ok: bool,
 }
 
 
@@ -615,6 +623,8 @@ impl Core {
             windows_dirty: false,
             retry_sync: None,
             syncing: false,
+            stale: false,
+            offline_ok: true,
             // Base request ids on the clock so ids from a restarted core never collide (#30).
             next_id: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -634,6 +644,7 @@ impl Core {
         self.session = None;
         self.retry_sync = None;
         self.syncing = false;
+        self.stale = false;
         self.approvals.clear();
         self.ssh_state.lock().await.clear();
         for (id, (p, _)) in self.pending.drain() {
@@ -701,6 +712,11 @@ impl Core {
             || self.retry_sync.is_some()
     }
 
+    /// The setting says not to work from a stale copy, and the copy is stale.
+    fn offline_blocked(&self) -> bool {
+        self.stale && !self.offline_ok
+    }
+
     /// Syncs the vault and reloads the SSH keys, off the loop. One at a time; nothing while
     /// locked. Keeps the retry wait, so a failure after this backs off further (#30).
     fn start_sync(&mut self) {
@@ -732,18 +748,21 @@ impl Core {
                 let (bw, tx, epoch) = (self.bw.clone(), self.done_tx.clone(), self.epoch);
                 let session = SecretString::from(session.as_str().to_owned());
                 tokio::spawn(async move {
-                    if bw.status(Some(&session)).await.as_deref() != Some("unlocked") {
+                    // One bw call: reading the items also proves the session (a bad one answers
+                    // "Vault is locked"). A separate `bw status` cost another second or more.
+                    let keys = load_keys_logged(&bw, &session).await;
+                    if matches!(keys, Err("locked")) {
                         let _ = tx.send(Done::UnlockFailed("session_rejected")).await;
                         return;
                     }
                     // Unlocked even when the keys can't be read, so credential requests still work;
                     // the panel says why there are no keys. Read from the copy on this Mac first,
                     // so unlock doesn't wait on the network (#12).
-                    let keys = load_keys_logged(&bw, &session).await;
                     let _ = tx.send(Done::Unlocked { epoch, session: session.clone(), keys }).await;
                 });
             }
             Cmd::Refresh => self.start_sync(),
+            Cmd::Config { offline_ok } => self.offline_ok = offline_ok,
             Cmd::Lock => self.lock_all(None).await,
             // Handled in run(): it needs the relay client.
             Cmd::NewToken { .. } => {}
@@ -807,6 +826,7 @@ impl Core {
                     return;
                 }
                 self.syncing = false;
+                self.stale = sync.is_some();
                 // Offline: try again by itself, 30 s doubling to 5 min. A login problem needs
                 // you, so no retry for it.
                 self.retry_sync = match sync {
@@ -916,6 +936,12 @@ impl Core {
             emit(json!({"ev":"resolved","id":id,"outcome":"locked","query":search,"about":secret_about(&search, None, &device)}));
             return;
         };
+        if self.offline_blocked() {
+            let _ = reply.send(deny_reply());
+            let device = self.labels.as_deref().map_or_else(|| short_id(&identity), |l| device_label(l, &identity));
+            emit(json!({"ev":"resolved","id":id,"outcome":"offline","query":search,"about":secret_about(&search, None, &device)}));
+            return;
+        }
         let waiting = self.pending.values().filter(|(p, _)| p.identity == identity).count()
             + self.looking.get(&identity).copied().unwrap_or(0);
         if waiting >= MAX_PENDING_PER_DEVICE {
@@ -943,6 +969,12 @@ impl Core {
             let about = ssh_agent::about(&ask);
             let _ = ask.reply.send(false);
             emit(json!({"ev":"resolved","id":id,"outcome":"locked","query":ask.key_name,"about":about}));
+            return;
+        }
+        if self.offline_blocked() {
+            let about = ssh_agent::about(&ask);
+            let _ = ask.reply.send(false);
+            emit(json!({"ev":"resolved","id":id,"outcome":"offline","query":ask.key_name,"about":about}));
             return;
         }
         if ask.auto {
@@ -1425,6 +1457,23 @@ mod tests {
         core.on_done(synced(Some("offline"))).await;
         core.lock_all(None).await;
         assert!(core.retry_sync.is_none() && !core.syncing, "lock stops retries");
+    }
+
+    /// With "work from the offline copy" off, a failed sync refuses requests until one works.
+    #[tokio::test]
+    async fn offline_copy_off_refuses_while_stale() {
+        let (mut core, _done, _locks) = test_core();
+        core.session = Some(session());
+        let synced = |sync| Done::Synced { epoch: 0, sync, keys: Ok(Vec::new()) };
+        core.on_done(synced(Some("offline"))).await;
+        assert!(!core.offline_blocked(), "default: the offline copy is used");
+        core.on_cmd(Cmd::Config { offline_ok: false }).await;
+        assert!(core.offline_blocked(), "off and stale: refused");
+        core.on_done(synced(None)).await;
+        assert!(!core.offline_blocked(), "a sync that works lifts it");
+        core.on_done(synced(Some("offline"))).await;
+        core.lock_all(None).await;
+        assert!(!core.stale, "a lock forgets the state; the next unlock syncs again");
     }
 
     #[tokio::test]

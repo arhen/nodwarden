@@ -90,6 +90,7 @@ final class Layout: ObservableObject {
 struct IslandView: View {
     @ObservedObject var core: Core
     @ObservedObject var layout: Layout
+    @ObservedObject private var settings = Settings.shared
     @State private var hovering: Bool
     @State private var pinned: Bool
     @State private var minutes = 10
@@ -209,7 +210,7 @@ struct IslandView: View {
             // Arm Touch ID by itself only when the island has been empty for a moment. After a
             // queue advance the next request waits for a click, so two touches can't release
             // two things (#14).
-            if old == nil, let id, Date().timeIntervalSince(clearedAt) > Self.rearmDelay,
+            if old == nil, let id, Settings.shared.autoTouchID, Date().timeIntervalSince(clearedAt) > Self.rearmDelay,
                let r = core.queue.first(where: { $0.id == id }) {
                 approve(r, minutes: nil, auto: true)
             }
@@ -229,7 +230,7 @@ struct IslandView: View {
     /// outside click or their own buttons.
     func collapseSoon() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-            guard !hovering, pinned, [.home, .agents, .history].contains(page), core.token == nil else { return }
+            guard !hovering, pinned, [.home, .agents, .history, .settings].contains(page), core.token == nil else { return }
             withAnimation(springClose) { pinned = false }
         }
     }
@@ -286,7 +287,7 @@ struct IslandView: View {
     }
 
     /// Identity for the right ear's content, so each change gets its own transition.
-    var trailingKey: String { core.unlocking ? "unlocking" : "state" }
+    var trailingKey: String { core.opening ? "opening" : core.unlocking ? "unlocking" : "state" }
 
     @ViewBuilder var trailingGlyph: some View {
         ZStack {
@@ -298,7 +299,11 @@ struct IslandView: View {
     }
 
     @ViewBuilder var trailingContent: some View {
-        if core.unlocking {
+        if core.opening {
+            // Touch ID went through: the lock opens at once, green, breathing until the vault is ready.
+            Image(systemName: "lock.open.fill").font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.green).symbolEffect(.pulse)
+        } else if core.unlocking {
             Image(systemName: "touchid").font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(.pink).symbolEffect(.pulse)
         } else {
@@ -330,6 +335,7 @@ struct IslandView: View {
         case .cancelled(let d): return ("xmark.circle.fill", .red, "Cancelled", d)
         case .notFound(let d): return ("exclamationmark.circle.fill", .orange, "No match", d)
         case .locked(let d): return ("exclamationmark.circle.fill", .orange, "Vault locked", d)
+        case .offline(let d): return ("icloud.slash", .orange, "Refused offline", d)
         }
     }
 
@@ -376,7 +382,8 @@ struct IslandView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
                         // user@host: when it doesn't fit, cut the user, never the verified host.
-                        Text(r.title).font(.system(size: 15, weight: .semibold)).lineLimit(1)
+                        MaskedText(text: r.title, masked: Settings.shared.maskRequests && r.ssh?.purpose != "git signing")
+                            .font(.system(size: 15, weight: .semibold)).lineLimit(1)
                             .truncationMode(r.ssh?.purpose == "login" ? .head : .tail)
                         if core.queue.count > 1 {
                             Text("+\(core.queue.count - 1)")
@@ -401,7 +408,7 @@ struct IslandView: View {
                 Spacer(minLength: 0)
                 // Offered only when the core would remember it: logins and git commit signing by
                 // a local program. Never for unverified data or a forwarded request.
-                if r.ssh?.canRemember ?? true {
+                if Settings.shared.offerWindows && (r.ssh?.canRemember ?? true) {
                     HStack(spacing: 0) {
                         Button { cancelPrompt(); approve(r, minutes: minutes) } label: {
                             HStack(spacing: 4) {
@@ -480,7 +487,7 @@ struct IslandView: View {
         // A click right after the request changed was meant for the previous one (#14).
         guard auto || Date().timeIntervalSince(shownAt) > 0.6 else { return }
         confirming = true
-        let what: String
+        var what: String
         if let s = r.ssh {
             let target: String
             switch s.purpose {
@@ -499,6 +506,9 @@ struct IslandView: View {
         let ctx = LAContext()
         prompt = ctx
         touchIDProblem = nil
+        if Settings.shared.maskRequests, r.ssh?.purpose != "git signing" {
+            what = what.replacingOccurrences(of: r.title, with: MaskedText.hint(r.title))
+        }
         // The window length is fixed now; the prompt text already names it (#25).
         let frozenMinutes = m
         confirmPresence(ctx, what) { ok, problem in

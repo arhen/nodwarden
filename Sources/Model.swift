@@ -45,7 +45,7 @@ struct AllowWindow: Identifiable, Equatable {
 /// One finished request, for the History tab. Memory only: it names hosts, items and
 /// usernames, which Bitwarden keeps encrypted on disk, so it is never written anywhere.
 struct HistoryEntry: Identifiable, Equatable {
-    enum Result: String { case allowed, auto, denied, expired, cancelled, notFound, locked }
+    enum Result: String { case allowed, auto, denied, expired, cancelled, notFound, locked, offline }
     let id: Int
     /// "login", "git", "secret" or "other".
     let kind: String
@@ -169,7 +169,7 @@ struct Notice: Equatable, Identifiable {
 enum VaultState: Equatable { case starting, locked, unlocked, offline(String) }
 
 enum Outcome: Hashable {
-    case approved(String), denied(String), auto(String), expired(String), notFound(String), locked(String), cancelled(String)
+    case approved(String), denied(String), auto(String), expired(String), notFound(String), locked(String), cancelled(String), offline(String)
 }
 
 /// Absolute tool paths, resolved once (#4). PATH is only used to find them; a path another

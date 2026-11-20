@@ -93,15 +93,6 @@ impl Bw {
         Ok(Output { ok: status.success(), stdout, stderr: String::from_utf8_lossy(&stderr).into_owned() })
     }
 
-    pub async fn status(&self, session: Option<&SecretString>) -> Option<String> {
-        #[derive(Deserialize)]
-        struct S {
-            status: String,
-        }
-        let out = self.run(session, &["status"]).await.ok()?;
-        serde_json::from_slice::<S>(&out.stdout).ok().map(|s| s.status)
-    }
-
     /// Locks bw so a session copied from anywhere stops working. Tries twice; the result is
     /// returned so a failure can be reported instead of silently claiming "locked" (#15).
     pub async fn lock(&self) -> bool {
@@ -119,7 +110,9 @@ impl Bw {
 pub fn reason(stderr: &str) -> &'static str {
     let s = stderr.to_ascii_lowercase();
     let any = |words: &[&str]| words.iter().any(|w| s.contains(w));
-    if any(&["invalid_grant", "not logged in", "unauthenticated", "statuscode: 401", "status: 401"]) {
+    if any(&["vault is locked", "master password"]) {
+        "locked"
+    } else if any(&["invalid_grant", "not logged in", "unauthenticated", "statuscode: 401", "status: 401"]) {
         "login"
     } else if any(&["unable to fetch", "econnrefused", "enotfound", "etimedout", "econnreset", "eai_again",
                     "fetch failed", "network", "statuscode: 5", "status: 5"]) {
@@ -386,6 +379,7 @@ mod tests {
         assert_eq!(reason("Error: invalid_grant"), "login");
         assert_eq!(reason("You are not logged in."), "login");
         assert_eq!(reason("Unexpected token in JSON"), "failed");
+        assert_eq!(reason("Vault is locked."), "locked", "a session bw doesn't accept");
     }
 
     #[tokio::test]
