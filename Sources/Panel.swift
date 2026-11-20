@@ -41,18 +41,19 @@ extension Core {
         }
     }
 
-    /// The panel header's dot and line. Nil when all is well: then the header is only the name.
-    var headerStatus: (dot: Color, line: String, tint: Color?, pulse: Bool)? {
+    /// The panel header's line, and a dot only when something isn't normal. `lead` is plain,
+    /// `note` is tinted: "Ready · relay connected", "Ready · offline copy".
+    var headerStatus: (dot: Color?, lead: String, note: String?, tint: Color?, pulse: Bool) {
         switch state {
-        case .starting: return (.white.opacity(0.45), "Starting…", nil, false)
-        case .offline: return (Tint.bad, "Stopped · restarting…", nil, false)
+        case .starting: return (.white.opacity(0.45), "Starting…", nil, nil, false)
+        case .offline: return (Tint.bad, "Stopped · restarting…", nil, nil, false)
         // While unlocking the button says "Waiting for Touch ID…"; the dot breathes.
-        case .locked: return (Tint.bad, "Locked", nil, unlocking)
+        case .locked: return (Tint.bad, "Locked", nil, nil, unlocking)
         case .unlocked:
-            if notice?.tone == .error { return (Tint.bad, "Needs attention", Tint.bad, false) }
-            if stale { return (Tint.warn, syncing ? "Syncing…" : "Offline copy", Tint.warn, false) }
-            if relayNote != nil { return (Tint.warn, "Agents paused, reconnecting", Tint.warn, false) }
-            return nil
+            if notice?.tone == .error { return (Tint.bad, "Needs attention", nil, Tint.bad, false) }
+            if stale { return (Tint.warn, "Ready", syncing ? "syncing…" : "offline copy", Tint.warn, false) }
+            if relayNote != nil { return (Tint.warn, "Ready", "agents paused, reconnecting", Tint.warn, false) }
+            return (nil, "Ready", "relay connected", nil, false)
         }
     }
 }
@@ -128,29 +129,33 @@ struct PanelView: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 12) {
                 Mark(size: 30).opacity(core.state == .unlocked ? 1 : 0.6)
-                // The name only when all is well; a dot and one line when something isn't.
+                // One status line always; a dot only when something isn't normal.
+                let st = core.headerStatus
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 7) {
                         Wordmark()
-                        if let st = core.headerStatus {
-                            StateDot(color: st.dot, pulse: st.pulse).transition(.scale.combined(with: .opacity))
+                        if let dot = st.dot {
+                            StateDot(color: dot, pulse: st.pulse).transition(.scale.combined(with: .opacity))
                         }
                     }
-                    if let st = core.headerStatus {
-                        HStack(spacing: 5) {
-                            Text(st.line)
-                                .foregroundStyle(st.tint ?? .white.opacity(0.55))
-                                .contentTransition(.interpolate)
-                            if core.state == .unlocked && core.stale && core.notice?.tone != .error {
-                                // Retries by itself; the button is for not waiting.
-                                SyncButton(spinning: core.syncing) { core.refresh() }
+                    HStack(spacing: 5) {
+                        Group {
+                            if let note = st.note {
+                                Text("\(st.lead) · ").foregroundColor(.white.opacity(0.55))
+                                    + Text(note).foregroundColor(st.tint ?? .white.opacity(0.55))
+                            } else {
+                                Text(st.lead).foregroundColor(st.tint ?? .white.opacity(0.55))
                             }
                         }
-                        .font(.system(size: 12))
-                        .lineLimit(1)
-                        .transition(.blurSwap(y: -4))
-                        .help(core.stale ? "Working from the copy on this Mac. NodWarden keeps trying the vault server." : "")
+                        .contentTransition(.interpolate)
+                        if core.state == .unlocked && core.stale && core.notice?.tone != .error {
+                            // Retries by itself; the button is for not waiting.
+                            SyncButton(spinning: core.syncing) { core.refresh() }
+                        }
                     }
+                    .font(.system(size: 12))
+                    .lineLimit(1)
+                    .help(core.stale ? "Working from the copy on this Mac. NodWarden keeps trying the vault server." : "")
                 }
                 Spacer(minLength: 0)
                 IconButton(symbol: "gearshape.fill", label: "Agents") { go(.agents) }
@@ -187,7 +192,7 @@ struct PanelView: View {
         .animation(reduceMotion ? .easeOut(duration: 0.15) : springSwap, value: core.state)
         .animation(reduceMotion ? .easeOut(duration: 0.15) : springSwap, value: core.windows.map(\.id))
         .animation(reduceMotion ? .easeOut(duration: 0.15) : springSwap, value: core.notice)
-        .animation(reduceMotion ? .easeOut(duration: 0.15) : springSwap, value: core.headerStatus?.line)
+        .animation(reduceMotion ? .easeOut(duration: 0.15) : springSwap, value: core.headerStatus.lead + (core.headerStatus.note ?? ""))
     }
 
     func retry(_ r: Notice.Retry) {
