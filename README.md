@@ -224,7 +224,7 @@ click them, so a screenshot or screen recording of the notch doesn't show them.
 
 **Settings.** ⚙ → Settings: hiding hosts and names (in lists, and optionally in requests), keeping
 history, idle lock (Never to 1 hour), locking on sleep, offering Allow-for-N-minutes, starting Touch ID
-by itself, the sound, working from the offline copy, and opening at login. No setting can skip Touch
+by itself, the sound, opening the panel on hover, working from the offline copy, and opening at login. No setting can skip Touch
 ID: at most it hides more or asks more often.
 
 **Without the relay.** The SSH agent and unlock work offline; only agent credential requests need the

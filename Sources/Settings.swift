@@ -21,6 +21,8 @@ final class Settings: ObservableObject {
     @Published var offerWindows: Bool { didSet { d.set(offerWindows, forKey: "offerWindows") } }
     @Published var autoTouchID: Bool { didSet { d.set(autoTouchID, forKey: "autoTouchID") } }
     @Published var sound: Bool { didSet { d.set(sound, forKey: "sound") } }
+    /// Open the panel when the pointer rests on the notch, not only on a click.
+    @Published var openOnHover: Bool { didSet { d.set(openOnHover, forKey: "openOnHover") } }
     /// Work from the copy on this Mac when the vault server can't be reached. The core enforces it.
     @Published var offlineCopy: Bool { didSet { d.set(offlineCopy, forKey: "offlineCopy") } }
 
@@ -35,6 +37,7 @@ final class Settings: ObservableObject {
         offerWindows = d.object(forKey: "offerWindows") as? Bool ?? true
         autoTouchID = d.object(forKey: "autoTouchID") as? Bool ?? true
         sound = d.object(forKey: "sound") as? Bool ?? true
+        openOnHover = d.object(forKey: "openOnHover") as? Bool ?? false
         offlineCopy = d.object(forKey: "offlineCopy") as? Bool ?? true
     }
 }
@@ -78,17 +81,57 @@ struct SettingsPage: View {
     @State private var login = LoginItem.state
     @State private var loginBusy = false
     @State private var loginProblem: String?
+    /// The list is scrolled to its end; until then a "More settings" pill says there's more.
+    @State private var atEnd = false
+    @State private var viewport: CGFloat = 0
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         // Taller than the space under the notch with every section open: it scrolls.
         VStack(alignment: .leading, spacing: 12) {
             if scrolls {
-                // Room at the end, so the last card scrolls clear of the fade.
-                ScrollView(.vertical, showsIndicators: false) { list.padding(.bottom, 18) }
+                ScrollViewReader { proxy in
+                    ScrollView(.vertical, showsIndicators: true) {
+                        VStack(spacing: 0) {
+                            list
+                            // Where the list ends, measured against the visible area.
+                            Color.clear.frame(height: 1).id("end")
+                                .background(GeometryReader { g in
+                                    Color.clear.preference(key: ListEnd.self, value: g.frame(in: .named("settings")).maxY)
+                                })
+                        }
+                        // Room at the end, so the last card scrolls clear of the fade and the pill.
+                        .padding(.bottom, 18)
+                    }
+                    .coordinateSpace(name: "settings")
                     .frame(maxHeight: 340)
-                    .mask(LinearGradient(stops: [.init(color: .black, location: 0.9), .init(color: .clear, location: 1)],
+                    .background(GeometryReader { g in
+                        Color.clear.onAppear { viewport = g.size.height }
+                            .onChange(of: g.size.height) { _, h in viewport = h }
+                    })
+                    .onPreferenceChange(ListEnd.self) { end in
+                        let done = end <= viewport + 4
+                        if done != atEnd { withAnimation(.easeOut(duration: 0.2)) { atEnd = done } }
+                    }
+                    .mask(LinearGradient(stops: [.init(color: .black, location: atEnd ? 1 : 0.82),
+                                                 .init(color: .clear, location: 1)],
                                          startPoint: .top, endPoint: .bottom))
+                    .overlay(alignment: .bottom) {
+                        if !atEnd {
+                            Button {
+                                withAnimation(reduceMotion ? .easeOut(duration: 0.2) : springOpen) { proxy.scrollTo("end", anchor: .bottom) }
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Text("More settings")
+                                    Image(systemName: "chevron.down").font(.system(size: 9, weight: .bold))
+                                }
+                            }
+                            .buttonStyle(Pill(.quiet, height: 24))
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .transition(.opacity.combined(with: .offset(y: 4)))
+                        }
+                    }
+                }
             } else {
                 list
             }
@@ -152,6 +195,10 @@ struct SettingsPage: View {
                     RowDivider()
                     toggle("Sound", $s.sound, id: "sound", info: "The chime when a request arrives.")
                 }
+                section("Notch") {
+                    toggle("Open on hover", $s.openOnHover, id: "openOnHover",
+                           info: "The panel opens when the pointer rests on the notch for a moment, and closes when it leaves. Off: click to open.")
+                }
                 section("Vault & app") {
                     toggle("Work from the offline copy", $s.offlineCopy, id: "offlineCopy",
                            info: "When the vault server can't be reached, use the copy on this Mac. Off: SSH and secrets are refused until a sync works.")
@@ -213,6 +260,12 @@ struct SettingsPage: View {
             }
         }
     }
+}
+
+/// Bottom edge of the settings list in the scroll view's coordinates.
+struct ListEnd: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }
 
 /// On/off switch drawn in SwiftUI, so it matches the notch and renders anywhere.

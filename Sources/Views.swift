@@ -175,6 +175,14 @@ struct IslandView: View {
             .onHover { h in
                 withAnimation(h ? springOpen : springClose) { hovering = h }
                 if !h, pinned { collapseSoon() }
+                // Settings → Open on hover. A short rest first, so passing over the notch on the
+                // way to the menu bar doesn't open it.
+                if h, settings.openOnHover, !pinned, current == nil {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                        guard hovering, !pinned, current == nil else { return }
+                        withAnimation(springOpen) { pinned = true }
+                    }
+                }
             }
             // Tapping opens the panel only from the small island. Once it's open, taps belong to
             // its buttons (End all, Lock, New agent token); it closes on an outside click, Esc or
@@ -229,7 +237,9 @@ struct IslandView: View {
     /// are working in (typing a name, confirming, a token to copy): those close on Esc, an
     /// outside click or their own buttons.
     func collapseSoon() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+        // Opened by hover: closes as soon as the pointer is gone. Opened by a click: a little grace,
+        // so a pointer that slips off the edge doesn't lose the panel.
+        DispatchQueue.main.asyncAfter(deadline: .now() + (settings.openOnHover ? 0.15 : 1.2)) {
             guard !hovering, pinned, [.home, .agents, .history, .settings].contains(page), core.token == nil else { return }
             withAnimation(springClose) { pinned = false }
         }
