@@ -24,6 +24,9 @@ final class Core: ObservableObject {
     /// Paired devices and unused tokens (#3), refreshed when the Agents view opens.
     @Published var paired: [Agent] = []
     @Published var tokens: [Agent] = []
+    /// Finished requests, newest first, at most `historyLimit`. Memory only; see HistoryEntry.
+    @Published var history: [HistoryEntry] = []
+    static let historyLimit = 200
     /// SSH keys loaded, for the header.
     @Published var keyCount = 0
     /// The reusable PSK token, when aac-core mints a new one (#19).
@@ -258,9 +261,11 @@ final class Core: ObservableObject {
             announceArrival()
         case "resolved":
             guard let id = e["id"] as? Int else { return }
-            let label = queue.first(where: { $0.id == id })?.title
+            let shown = queue.first(where: { $0.id == id })
+            let label = shown?.title
                 ?? (e["domain"] as? String) ?? (e["query"] as? String) ?? ""
             queue.removeAll { $0.id == id }
+            record(id: id, outcome: e["outcome"] as? String, shown: shown, about: e["about"] as? [String: Any])
             switch e["outcome"] as? String {
             case "approved": flash(.approved(label))
             case "denied": flash(.denied(label))
@@ -273,6 +278,48 @@ final class Core: ObservableObject {
             }
         default: break
         }
+    }
+
+    /// Adds a finished request to the history. Back-to-back repeats of what happened without
+    /// you (auto, locked) for the same target fold into one row; your own answers never do.
+    private func record(id: Int, outcome: String?, shown: CredRequest?, about: [String: Any]?) {
+        let result: HistoryEntry.Result
+        switch outcome {
+        case "approved": result = .allowed
+        case "auto": result = .auto
+        case "denied": result = .denied
+        case "expired": result = .expired
+        case "cancelled": result = .cancelled
+        case "not_found": result = .notFound
+        case "locked": result = .locked
+        default: return
+        }
+        let kind: String, title: String, sub: String
+        if let r = shown {
+            title = r.title
+            if let s = r.ssh {
+                kind = s.purpose == "login" ? "login" : s.purpose == "git signing" ? "git" : "other"
+                sub = "\(s.key) · \(s.via.map { "forwarded from \($0)" } ?? s.app)"
+            } else {
+                kind = "secret"
+                sub = "\(r.detail.components(separatedBy: "  ·  ").first ?? "") · → \(r.device)"
+            }
+        } else if let a = about {
+            kind = a["kind"] as? String ?? "other"
+            title = a["title"] as? String ?? "Request"
+            sub = a["sub"] as? String ?? ""
+        } else {
+            return
+        }
+        if [.auto, .locked].contains(result), var last = history.first,
+           last.result == result, last.kind == kind, last.title == title, last.sub == sub {
+            last.count += 1
+            last.at = Date()
+            history[0] = last
+            return
+        }
+        history.insert(HistoryEntry(id: id, kind: kind, title: title, sub: sub, result: result, at: Date()), at: 0)
+        if history.count > Core.historyLimit { history.removeLast(history.count - Core.historyLimit) }
     }
 
     private let arrivalSound: NSSound? = {

@@ -184,6 +184,16 @@ func snapshot(to dir: String) {
     page("p8c-login", .home) { $0.state = .unlocked; $0.keyCount = 14; $0.stale = true; $0.show("login") }
     page("p4-agents", .agents, agents)
     page("p4b-agents-empty", .agents) { $0.state = .unlocked }
+    let past: [HistoryEntry] = [
+        HistoryEntry(id: 1, kind: "git", title: "Git commit", sub: "Signin Key · fish", result: .auto, at: now.addingTimeInterval(-60), count: 12),
+        HistoryEntry(id: 2, kind: "git", title: "Git commit", sub: "Signin Key · fish", result: .allowed, at: now.addingTimeInterval(-900)),
+        HistoryEntry(id: 3, kind: "login", title: "git@github.com", sub: "Github Key · fish", result: .allowed, at: now.addingTimeInterval(-1700)),
+        HistoryEntry(id: 4, kind: "secret", title: "Acme deploy", sub: "deploy-bot · → claude-code", result: .denied, at: now.addingTimeInterval(-2700)),
+        HistoryEntry(id: 5, kind: "login", title: "root@203.0.113.7", sub: "Server Key · node", result: .expired, at: now.addingTimeInterval(-3100)),
+        HistoryEntry(id: 6, kind: "secret", title: "GitHub", sub: "octocat · → claude-code", result: .allowed, at: now.addingTimeInterval(-90000)),
+    ]
+    page("p10-history", .history) { $0.state = .unlocked; $0.history = past }
+    page("p10b-history-empty", .history) { $0.state = .unlocked }
     page("p5-confirm-device", .confirm(.device(Agent(id: "9b21de4400", name: nil, since: now))), agents)
     page("p5b-confirm-all", .confirm(.all), agents)
     page("p6-new-token", .newToken) { $0.state = .unlocked }

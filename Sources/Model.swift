@@ -42,6 +42,21 @@ struct AllowWindow: Identifiable, Equatable {
     let total: Double
 }
 
+/// One finished request, for the History tab. Memory only: it names hosts, items and
+/// usernames, which Bitwarden keeps encrypted on disk, so it is never written anywhere.
+struct HistoryEntry: Identifiable, Equatable {
+    enum Result: String { case allowed, auto, denied, expired, cancelled, notFound, locked }
+    let id: Int
+    /// "login", "git", "secret" or "other".
+    let kind: String
+    let title: String
+    let sub: String
+    let result: Result
+    var at: Date
+    /// Back-to-back repeats folded into this row (auto and locked only).
+    var count = 1
+}
+
 /// A device that paired with a token, or a token no device has used yet (#3).
 struct Agent: Identifiable, Equatable {
     let id: String

@@ -5,7 +5,7 @@ import SwiftUI
 // MARK: - Status panel: home, Agents, new token. Everything stays inside the notch.
 
 enum Page: Equatable {
-    case home, agents, newToken
+    case home, agents, history, newToken
     case confirm(Removal)
     case rename(Agent, device: Bool)
 }
@@ -86,6 +86,7 @@ struct PanelView: View {
         switch page {
         case .home: return "home"
         case .agents: return "agents"
+        case .history: return "history"
         case .newToken: return "new"
         case .confirm: return "confirm"
         case .rename: return "rename"
@@ -101,6 +102,7 @@ struct PanelView: View {
                     switch page {
                     case .home: home
                     case .agents: agents
+                    case .history: historyPage
                     case .newToken: newToken
                     case .confirm(let r): confirm(r)
                     case .rename(let a, let device): rename(a, device: device)
@@ -238,7 +240,7 @@ struct PanelView: View {
             Card {
                 ForEach(Array(groups.enumerated()), id: \.element.id) { i, g in
                     if i > 0 { RowDivider() }
-                    Row(symbol: symbol(g.kind), title: g.title, sub: g.sub, count: g.ids.count) {
+                    Row(symbol: symbol(g.kind), title: g.title, sub: g.sub, count: g.ids.count, hidden: g.kind == "login" || g.kind == "secret") {
                         HStack(spacing: 8) {
                             TimeRing(until: g.until, total: g.total)
                             XButton(label: "End \(g.title)") { core.endWindows(g.ids) }
@@ -275,12 +277,15 @@ struct PanelView: View {
 
     var agents: some View {
         VStack(alignment: .leading, spacing: 14) {
-            subHeader("Agents", "Who can ask for secrets", back: .home, trailing: AnyView(
-                Button("New token") { name = ""; go(.newToken) }.buttonStyle(Pill(.primary))
-            ))
+            tabsHeader
             if core.paired.isEmpty && core.tokens.isEmpty {
-                Text("No agents yet. Make a token and give it to one.")
-                    .font(.system(size: 12)).foregroundStyle(.white.opacity(0.5))
+                HStack {
+                    Text("No agents yet. Make a token and give it to one.")
+                        .font(.system(size: 12)).foregroundStyle(.white.opacity(0.5))
+                    Spacer()
+                    newTokenLink
+                }
+                .padding(.horizontal, 4)
             }
             if !core.paired.isEmpty {
                 VStack(alignment: .leading, spacing: 7) {
@@ -301,7 +306,7 @@ struct PanelView: View {
             }
             if !core.tokens.isEmpty {
                 VStack(alignment: .leading, spacing: 7) {
-                    SectionLabel(text: "Tokens") { EmptyView() }
+                    SectionLabel(text: "Tokens") { newTokenLink }
                     Card {
                         ForEach(Array(core.tokens.enumerated()), id: \.element.id) { i, t in
                             if i > 0 { RowDivider() }
@@ -316,11 +321,7 @@ struct PanelView: View {
                 }
             }
             if !core.paired.isEmpty || !core.tokens.isEmpty {
-                Button("Revoke everything") { go(.confirm(.all)) }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(Pill.dangerText)
-                    .frame(maxWidth: .infinity)
+                DangerLink(title: "Revoke everything", help: "Remove every agent and token") { go(.confirm(.all)) }
             }
         }
         .onAppear { core.loadAgents() }
@@ -333,6 +334,106 @@ struct PanelView: View {
         f.unitsStyle = .short
         let when = Date().timeIntervalSince(last) < 120 ? "just now" : f.localizedString(for: last, relativeTo: Date())
         return "Last used \(when)" + (t.usedBy.map { " · by \($0)" } ?? "")
+    }
+
+    var newTokenLink: some View {
+        Button { name = ""; go(.newToken) } label: {
+            Label("New token", systemImage: "plus").labelStyle(.titleAndIcon)
+        }
+        .buttonStyle(.plain)
+        .font(.system(size: 11.5, weight: .semibold))
+        .foregroundStyle(.white.opacity(0.8))
+    }
+
+    /// ‹ back on the left, the Agents | History switch on the right.
+    var tabsHeader: some View {
+        HStack(spacing: 10) {
+            IconButton(symbol: "chevron.left", label: "Back") { go(.home) }
+            Spacer(minLength: 0)
+            Segmented(options: ["Agents", "History"], selected: page == .history ? 1 : 0) { i in
+                go(i == 0 ? .agents : .history)
+            }
+            .frame(width: 200)
+        }
+    }
+
+    // MARK: history
+
+    @State private var showAll = false
+
+    var historyPage: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            tabsHeader
+            if core.history.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: "clock.arrow.circlepath").font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.35))
+                    Text("Nothing yet").font(.system(size: 13, weight: .semibold)).foregroundStyle(.white.opacity(0.7))
+                    Text("Requests you allow or deny show up here.\nKept in memory; cleared when NodWarden quits.")
+                        .font(.system(size: 11)).foregroundStyle(.white.opacity(0.45)).multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 18)
+            } else {
+                let shown = Array(core.history.prefix(showAll ? 25 : 5))
+                Group {
+                    if showAll {
+                        ScrollView(.vertical, showsIndicators: false) { historyDays(shown) }
+                            .frame(height: 300)
+                            .mask(LinearGradient(stops: [.init(color: .black, location: 0.88), .init(color: .clear, location: 1)],
+                                                 startPoint: .top, endPoint: .bottom))
+                    } else {
+                        historyDays(shown)
+                    }
+                }
+                if core.history.count > 5 {
+                    Button(showAll ? "Show less" : "Show more") {
+                        withAnimation(reduceMotion ? .easeOut(duration: 0.15) : springOpen) { showAll.toggle() }
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.75))
+                    .padding(.horizontal, 4)
+                }
+                DangerLink(title: "Clear history", help: "Forget every entry now") {
+                    withAnimation(reduceMotion ? .easeOut(duration: 0.15) : springSwap) {
+                        core.history.removeAll()
+                        showAll = false
+                    }
+                }
+            }
+        }
+    }
+
+    func historyDays(_ entries: [HistoryEntry]) -> some View {
+        let days = Dictionary(grouping: entries) { Calendar.current.startOfDay(for: $0.at) }
+            .sorted { $0.key > $1.key }
+        return VStack(alignment: .leading, spacing: 10) {
+            ForEach(days, id: \.key) { day, items in
+                VStack(alignment: .leading, spacing: 7) {
+                    SectionLabel(text: dayLabel(day)) { EmptyView() }
+                    Card {
+                        ForEach(Array(items.enumerated()), id: \.element.id) { i, h in
+                            if i > 0 { RowDivider() }
+                            Row(symbol: symbol(h.kind), title: h.title, sub: h.sub,
+                                hidden: h.kind == "login" || h.kind == "secret", hiddenSub: h.kind == "secret") {
+                                VStack(alignment: .trailing, spacing: 3) {
+                                    ResultBadge(result: h.result, count: h.count)
+                                    Text(h.at, format: .dateTime.hour().minute())
+                                        .font(.system(size: 10.5).monospacedDigit()).foregroundStyle(.white.opacity(0.4))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func dayLabel(_ d: Date) -> String {
+        if Calendar.current.isDateInToday(d) { return "Today" }
+        if Calendar.current.isDateInYesterday(d) { return "Yesterday" }
+        return d.formatted(.dateTime.day().month(.abbreviated))
     }
 
     func day(_ d: Date) -> String { d.formatted(.dateTime.month(.abbreviated).day()) }
@@ -558,6 +659,106 @@ struct Wordmark: View {
     }
 }
 
+/// Two-option switch; the selected one is a white pill.
+struct Segmented: View {
+    let options: [String]
+    let selected: Int
+    let pick: (Int) -> Void
+    @Namespace private var ns
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(Array(options.enumerated()), id: \.offset) { i, t in
+                Button { pick(i) } label: {
+                    Text(t).font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(i == selected ? .black : .white.opacity(0.7))
+                        .frame(maxWidth: .infinity).frame(height: 26)
+                        .background {
+                            if i == selected { Capsule().fill(.white).matchedGeometryEffect(id: "tab", in: ns) }
+                        }
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(i == selected ? .isSelected : [])
+            }
+        }
+        .padding(3)
+        .background(.white.opacity(0.1), in: Capsule())
+        .animation(springSwap, value: selected)
+    }
+}
+
+/// The one destructive action at the end of a tab: centred red text (Revoke everything,
+/// Clear history).
+struct DangerLink: View {
+    let title: String
+    let help: String
+    let action: () -> Void
+    var body: some View {
+        Button(title, action: action)
+            .buttonStyle(.plain)
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(Pill.dangerText)
+            .frame(maxWidth: .infinity)
+            .help(help)
+    }
+}
+
+struct ResultBadge: View {
+    let result: HistoryEntry.Result
+    var count = 1
+    var style: (String, Color) {
+        switch result {
+        case .allowed: return ("Allowed", Tint.ok)
+        case .auto: return (count > 1 ? "Auto ×\(count)" : "Auto", Tint.ok)
+        case .denied: return ("Denied", Tint.bad)
+        case .expired: return ("Timed out", Tint.warn)
+        case .cancelled: return ("Cancelled", .white.opacity(0.5))
+        case .notFound: return ("No match", .white.opacity(0.5))
+        case .locked: return (count > 1 ? "Locked ×\(count)" : "Locked", .white.opacity(0.5))
+        }
+    }
+    var body: some View {
+        let (t, c) = style
+        Text(t).font(.system(size: 10.5, weight: .bold)).foregroundStyle(c)
+            .padding(.horizontal, 8).frame(height: 20)
+            .background(c.opacity(0.14), in: Capsule())
+    }
+}
+
+/// Drifting, twinkling specks; positions come from a fixed seed so they don't jump on redraw.
+struct Ink: View {
+    @Environment(\.accessibilityReduceMotion) private var still
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1 / 30, paused: still)) { ctx in
+            let t = still ? 0 : ctx.date.timeIntervalSinceReferenceDate
+            Canvas { g, size in
+                let n = Int(size.width * size.height / 4)
+                var seed: UInt64 = 0x9E3779B97F4A7C15
+                func rnd() -> Double {
+                    seed &+= 0x9E3779B97F4A7C15
+                    var z = seed
+                    z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+                    z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+                    return Double(z ^ (z >> 31)) / Double(UInt64.max)
+                }
+                for _ in 0..<n {
+                    let x0 = rnd() * size.width, y0 = rnd() * size.height
+                    let speed = 1.5 + rnd() * 3.5, angle = rnd() * .pi * 2, phase = rnd() * 6
+                    let x = (x0 + cos(angle) * speed * t).truncatingRemainder(dividingBy: size.width)
+                    let y = (y0 + sin(angle) * speed * t).truncatingRemainder(dividingBy: size.height)
+                    let a = 0.3 + 0.5 * (0.5 + 0.5 * sin(t * 2 + phase))
+                    let r = 0.25 + rnd() * 0.25
+                    g.fill(Path(ellipseIn: CGRect(x: (x + size.width).truncatingRemainder(dividingBy: size.width) - r,
+                                                  y: (y + size.height).truncatingRemainder(dividingBy: size.height) - r,
+                                                  width: r * 2, height: r * 2)),
+                           with: .color(.white.opacity(a)))
+                }
+            }
+        }
+    }
+}
+
+
 /// A state dot; it breathes while something is waiting on you.
 struct StateDot: View {
     let color: Color
@@ -749,27 +950,93 @@ struct Row<Trailing: View>: View {
     let title: String
     let sub: String
     var count = 1
+    /// Mask the title (a host, item name or login) until clicked; its first letters stay.
+    var hidden = false
+    /// Mask the sub line's first part too (a username), keeping what follows " · ".
+    var hiddenSub = false
     @ViewBuilder var trailing: Trailing
+    @State private var revealed = false
     var body: some View {
         HStack(spacing: 10) {
             Tile(symbol: symbol)
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 5) {
-                    Text(title).font(.system(size: 13, weight: .semibold)).lineLimit(1).truncationMode(.middle)
+                    MaskedText(text: title, masked: hidden && !revealed)
+                        .font(.system(size: 13, weight: .semibold))
                     if count > 1 {
                         Text("×\(count)").font(.system(size: 10, weight: .bold))
                             .padding(.horizontal, 5).padding(.vertical, 1)
                             .background(.white.opacity(0.14), in: Capsule())
                     }
                 }
-                Text(sub).font(.system(size: 11)).foregroundStyle(.white.opacity(0.5)).lineLimit(1)
+                subLine.font(.system(size: 11)).foregroundStyle(.white.opacity(0.5))
             }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                guard hidden || hiddenSub else { return }
+                withAnimation(.easeOut(duration: 0.3)) { revealed.toggle() }
+            }
+            .help(hidden || hiddenSub ? (revealed ? "Click to hide" : "Click to show") : "")
             Spacer(minLength: 8)
             trailing
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
+        .onDisappear { revealed = false }
         .accessibilityElement(children: .contain)
+    }
+
+    @ViewBuilder var subLine: some View {
+        if hiddenSub, let r = sub.range(of: " · ") {
+            HStack(spacing: 0) {
+                MaskedText(text: String(sub[..<r.lowerBound]), masked: !revealed)
+                Text(sub[r.lowerBound...]).lineLimit(1)
+            }
+        } else {
+            Text(sub).lineLimit(1)
+        }
+    }
+}
+
+/// Text with everything but a short hint drawn as "invisible ink": the first two letters and
+/// the punctuation (@ . : - · space) stay, so you can tell rows apart; letters and digits after
+/// that are not drawn at all, only drifting specks where they would be. So a screenshot or a
+/// screen recording of the notch shows "ro••@20•.•.•.•" and never the host itself.
+struct MaskedText: View {
+    let text: String
+    let masked: Bool
+    static let keep = 2
+
+    /// Runs of (text, hidden).
+    var runs: [(String, Bool)] {
+        var out: [(String, Bool)] = []
+        for (i, c) in text.enumerated() {
+            let hide = i >= MaskedText.keep && (c.isLetter || c.isNumber)
+            if let last = out.last, last.1 == hide { out[out.count - 1].0.append(c) } else { out.append((String(c), hide)) }
+        }
+        return out
+    }
+
+    var body: some View {
+        if !masked {
+            Text(text).lineLimit(1).truncationMode(.middle).transition(.opacity)
+        } else {
+            HStack(spacing: 0) {
+                ForEach(Array(runs.enumerated()), id: \.offset) { _, r in
+                    if r.1 {
+                        // Same width as the real letters, so the row keeps its shape; nothing of
+                        // them is drawn.
+                        Text(r.0).hidden().overlay { Ink() }
+                    } else {
+                        Text(r.0)
+                    }
+                }
+            }
+            .lineLimit(1)
+            .fixedSize()
+            .accessibilityLabel("\(text.prefix(MaskedText.keep)), hidden. Click the row to show.")
+            .transition(.opacity)
+        }
     }
 }
 

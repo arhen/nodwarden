@@ -216,6 +216,11 @@ named token, rename a device or token, remove one, or revoke everything. Removin
 Agent connections drop for a couple of seconds while the list is applied; the vault and the SSH
 agent stay as they are.
 
+**History.** Click the island, then ⚙ → History: what was asked, by which program or device, and
+what happened (allowed, auto, denied, timed out). It is kept in memory only and cleared when NodWarden
+quits. Hosts, item names and usernames there and in the Allow list are hidden under a spoiler until you
+click them, so a screenshot or screen recording of the notch doesn't show them.
+
 **Without the relay.** The SSH agent and unlock work offline; only agent credential requests need the
 relay.
 

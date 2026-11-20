@@ -26,7 +26,9 @@
 //!                                                         automatic retry while offline)
 //!          {"ev":"request","id":N,"name":..,"domain":..,"username":..,"device":..,"kind":..,"has_totp":..}
 //!          {"ev":"ssh_request","id":N,...}                see ssh_agent::ask_json
-//!          {"ev":"resolved","id":N,"outcome":"approved"|"denied"|"auto"|"expired"|"not_found"|"locked"|"cancelled"}
+//!          {"ev":"resolved","id":N,"outcome":"approved"|"denied"|"auto"|"expired"|"not_found"|"locked"|"cancelled",
+//!           "about":{"kind","title","sub"}?}   about: for requests that never showed a card
+//!           (auto, locked, no match), so the history can name them. Never a secret.
 //!          {"ev":"notice","code":..}                      something the user should know; the
 //!                                                         panel words each code
 //! Diagnostics go to stderr (the log file), never to the panel as raw text.
@@ -247,11 +249,17 @@ fn host_of(uri: &str) -> Option<String> {
 }
 
 fn device_label(conns: &[ap_client::ConnectionInfo], id: &IdentityFingerprint) -> String {
-    conns
-        .iter()
-        .find(|c| &c.fingerprint == id)
-        .and_then(|c| c.name.clone())
-        .unwrap_or_else(|| hex::encode(id.0).chars().take(12).collect())
+    conns.iter().find(|c| &c.fingerprint == id).and_then(|c| c.name.clone()).unwrap_or_else(|| short_id(id))
+}
+
+fn short_id(id: &IdentityFingerprint) -> String {
+    hex::encode(id.0).chars().take(12).collect()
+}
+
+/// A secret request, for the history: item (or what was asked for), username, device.
+fn secret_about(title: &str, username: Option<&str>, device: &str) -> Value {
+    let sub = username.map_or_else(|| format!("→ {device}"), |u| format!("{u} · → {device}"));
+    json!({"kind": "secret", "title": title, "sub": sub})
 }
 
 /// When each pairing token was last used, and by which device: ~/.nodwarden/token-usage.json.
@@ -539,7 +547,7 @@ enum Done {
     Looked { epoch: u64, id: u64, identity: IdentityFingerprint, query_key: String, kind: &'static str,
              reply: oneshot::Sender<CredentialRequestReply>, result: Lookup },
     Released { epoch: u64, id: u64, reply: oneshot::Sender<CredentialRequestReply>, cred: Option<CredentialData>,
-               auto: bool, domain: Option<String> },
+               auto: bool, domain: Option<String>, about: Value },
 }
 
 struct Core {
@@ -707,14 +715,14 @@ impl Core {
     }
 
     /// Fetches the secret and replies, off the main loop.
-    fn release(&self, id: u64, info: ItemInfo, reply: oneshot::Sender<CredentialRequestReply>, auto: bool) {
+    fn release(&self, id: u64, info: ItemInfo, reply: oneshot::Sender<CredentialRequestReply>, auto: bool, about: Value) {
         let (bw, session, tx, epoch) = (self.bw.clone(), self.session.clone(), self.done_tx.clone(), self.epoch);
         tokio::spawn(async move {
             let cred = match session {
                 Some(s) => bw_secret(&bw, &s, &info).await,
                 None => None,
             };
-            let _ = tx.send(Done::Released { epoch, id, reply, cred, auto, domain: info.domain }).await;
+            let _ = tx.send(Done::Released { epoch, id, reply, cred, auto, domain: info.domain, about }).await;
         });
     }
 
@@ -771,7 +779,7 @@ impl Core {
                     self.approvals.insert((p.identity, p.item_id.clone()), (Instant::now() + w, w.as_secs(), info.name.clone()));
                     self.report_windows().await;
                 }
-                self.release(id, info, p.reply, false);
+                self.release(id, info, p.reply, false, Value::Null);
             }
             // Handled in run(): they restart the relay client.
             _ => {}
@@ -834,35 +842,37 @@ impl Core {
                     }
                 }
                 // Started before a lock: deny it, and don't let a stale "locked" lock again (#19).
+                let device = device_label(self.device_labels().await, &identity);
+                let asked = secret_about(&query_key, None, &device);
                 if epoch != self.epoch {
                     let _ = reply.send(deny_reply());
-                    emit(json!({"ev":"resolved","id":id,"outcome":"locked","query":query_key}));
+                    emit(json!({"ev":"resolved","id":id,"outcome":"locked","query":query_key,"about":asked}));
                     return;
                 }
                 let info = match result {
                     Lookup::Found(i) => i,
                     Lookup::Locked => {
                         let _ = reply.send(deny_reply());
-                        emit(json!({"ev":"resolved","id":id,"outcome":"locked","query":query_key}));
+                        emit(json!({"ev":"resolved","id":id,"outcome":"locked","query":query_key,"about":asked}));
                         self.lock_all(Some("bw_locked")).await;
                         return;
                     }
                     Lookup::NotFound(why) => {
                         let _ = reply.send(deny_reply());
-                        emit(json!({"ev":"resolved","id":id,"outcome":"not_found","query":query_key,"detail":why}));
+                        emit(json!({"ev":"resolved","id":id,"outcome":"not_found","query":query_key,"detail":why,"about":asked}));
                         return;
                     }
                 };
                 if self.session.is_none() {
                     let _ = reply.send(deny_reply());
-                    emit(json!({"ev":"resolved","id":id,"outcome":"locked","query":query_key}));
+                    emit(json!({"ev":"resolved","id":id,"outcome":"locked","query":query_key,"about":asked}));
                     return;
                 }
                 if self.approvals.get(&(identity, info.id.clone())).is_some_and(|(t, _, _)| *t > Instant::now()) {
-                    self.release(id, info, reply, true);
+                    let about = secret_about(&info.name, info.username.as_deref(), &device);
+                    self.release(id, info, reply, true, about);
                     return;
                 }
-                let device = device_label(self.device_labels().await, &identity);
                 emit(json!({
                     "ev":"request","id":id,"kind":kind,
                     "name":info.name,"domain":info.domain,"username":info.username,
@@ -873,12 +883,12 @@ impl Core {
                 let p = Pending { identity, item_id: info.id.clone(), reply, deadline: Instant::now() + REQUEST_TIMEOUT };
                 self.pending.insert(id, (p, info));
             }
-            Done::Released { epoch, id, reply, domain, .. } if epoch != self.epoch => {
+            Done::Released { epoch, id, reply, domain, about, .. } if epoch != self.epoch => {
                 // Locked while the secret was being read: it is dropped (and wiped), not sent.
                 let _ = reply.send(deny_reply());
-                emit(json!({"ev":"resolved","id":id,"outcome":"locked","domain":domain}));
+                emit(json!({"ev":"resolved","id":id,"outcome":"locked","domain":domain,"about":about}));
             }
-            Done::Released { id, reply, cred, auto, domain, .. } => {
+            Done::Released { id, reply, cred, auto, domain, about, .. } => {
                 let ok = cred.is_some();
                 let cid = cred.as_ref().and_then(|c| c.credential_id.clone());
                 let _ = reply.send(CredentialRequestReply { approved: ok, credential: cred, credential_id: cid });
@@ -887,7 +897,7 @@ impl Core {
                     (true, true) => "auto",
                     (true, false) => "approved",
                 };
-                emit(json!({"ev":"resolved","id":id,"outcome":outcome,"domain":domain}));
+                emit(json!({"ev":"resolved","id":id,"outcome":outcome,"domain":domain,"about":about}));
             }
         }
     }
@@ -902,7 +912,8 @@ impl Core {
         let search = query.search_string().to_string();
         let Some(session) = self.session.clone() else {
             let _ = reply.send(deny_reply());
-            emit(json!({"ev":"resolved","id":id,"outcome":"locked","query":search}));
+            let device = self.labels.as_deref().map_or_else(|| short_id(&identity), |l| device_label(l, &identity));
+            emit(json!({"ev":"resolved","id":id,"outcome":"locked","query":search,"about":secret_about(&search, None, &device)}));
             return;
         };
         let waiting = self.pending.values().filter(|(p, _)| p.identity == identity).count()
@@ -929,13 +940,15 @@ impl Core {
     fn on_ssh_ask(&mut self, ask: ssh_agent::SignAsk) {
         let id = self.new_id();
         if self.session.is_none() {
+            let about = ssh_agent::about(&ask);
             let _ = ask.reply.send(false);
-            emit(json!({"ev":"resolved","id":id,"outcome":"locked","query":ask.key_name}));
+            emit(json!({"ev":"resolved","id":id,"outcome":"locked","query":ask.key_name,"about":about}));
             return;
         }
         if ask.auto {
             // Already allowed: tell the UI it happened (#22), nothing to decide.
-            emit(json!({"ev":"resolved","id":id,"outcome":"auto","domain":ask.host.clone().unwrap_or_else(|| ask.key_name.clone())}));
+            emit(json!({"ev":"resolved","id":id,"outcome":"auto","domain":ask.host.clone().unwrap_or_else(|| ask.key_name.clone()),
+                        "about":ssh_agent::about(&ask)}));
             let _ = ask.reply.send(true);
             return;
         }
@@ -1278,13 +1291,13 @@ mod tests {
         let started = core.epoch;
         let (tx, rx) = oneshot::channel();
         core.lock_all(None).await;
-        core.on_done(Done::Released { epoch: started, id: 1, reply: tx, cred: Some(credential()), auto: false, domain: None }).await;
+        core.on_done(Done::Released { epoch: started, id: 1, reply: tx, cred: Some(credential()), auto: false, domain: None, about: Value::Null }).await;
         let reply = rx.await.unwrap();
         assert!(!reply.approved && reply.credential.is_none());
 
         // Without a lock in between it goes out.
         let (tx, rx) = oneshot::channel();
-        core.on_done(Done::Released { epoch: core.epoch, id: 2, reply: tx, cred: Some(credential()), auto: false, domain: None }).await;
+        core.on_done(Done::Released { epoch: core.epoch, id: 2, reply: tx, cred: Some(credential()), auto: false, domain: None, about: Value::Null }).await;
         assert!(rx.await.unwrap().approved);
     }
 

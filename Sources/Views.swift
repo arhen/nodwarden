@@ -162,9 +162,12 @@ struct IslandView: View {
                     .fill(.black)
                     .shadow(color: .black.opacity(shadowOpacity), radius: 18, y: 8)
 
+                // Clipped to the island: while it grows or shrinks, nothing shows outside it.
                 content
                     .foregroundStyle(.white)
                     .padding(.horizontal, 8 + 14)
+                    .frame(width: size.width, height: size.height, alignment: .top)
+                    .clipShape(IslandShape(top: 8, bottom: cornerRadius))
             }
             .frame(width: size.width, height: size.height)
             .contentShape(Rectangle())
@@ -191,7 +194,12 @@ struct IslandView: View {
         .onChange(of: layout.dismissTick) { _, _ in
             if pinned { withAnimation(springClose) { pinned = false } }
         }
-        .onChange(of: pinned) { _, p in if !p { page = .home } }
+        .onChange(of: pinned) { _, p in
+            guard !p else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+                if !pinned { var t = Transaction(); t.disablesAnimations = true; withTransaction(t) { page = .home } }
+            }
+        }
         // A new token is shown once: keep the panel open on it.
         .onChange(of: core.token) { _, t in if t != nil, current == nil { withAnimation(springOpen) { pinned = true } } }
         .onChange(of: current?.id) { old, id in
@@ -221,7 +229,7 @@ struct IslandView: View {
     /// outside click or their own buttons.
     func collapseSoon() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-            guard !hovering, pinned, page == .home || page == .agents, core.token == nil else { return }
+            guard !hovering, pinned, [.home, .agents, .history].contains(page), core.token == nil else { return }
             withAnimation(springClose) { pinned = false }
         }
     }
@@ -245,7 +253,12 @@ struct IslandView: View {
             Spacer(minLength: 0)
             if notch.width > 0 { trailingGlyph }
         }
-        .transition(.opacity.combined(with: .scale(scale: 0.9)))
+        // The ears come back once the panel has mostly folded, and leave at once when it opens,
+        // so they never show on top of the panel's content.
+        .transition(.asymmetric(
+            insertion: .opacity.animation(.easeOut(duration: 0.18).delay(0.16)),
+            removal: .opacity.animation(.easeOut(duration: 0.08))
+        ))
     }
 
     /// The brand mark always holds the left ear; state lives on the right.
@@ -441,9 +454,24 @@ struct IslandView: View {
             .background(GeometryReader { g in
                 Color.clear
                     .onAppear { panelHeight = g.size.height }
-                    .onChange(of: g.size.height) { _, h in panelHeight = h }
+                    // A page change inside the panel resizes the island with the same spring
+                    // as the content swap, instead of jumping.
+                    .onChange(of: g.size.height) { _, h in
+                        withAnimation(reduceMotion ? .easeOut(duration: 0.15) : springSwap) { panelHeight = h }
+                    }
             })
-            .transition(.opacity.animation(springOpen.delay(0.06)))
+            .transition(.asymmetric(
+                insertion: .opacity.animation(springOpen.delay(0.06)),
+                removal: .opacity.animation(.easeOut(duration: 0.1))
+            ))
+    }
+
+    /// How long a Touch ID approval lasts, for the prompt: ", this time only" or
+    /// " for the next 10 minutes (until 23:16), without asking again".
+    func duration(_ m: Int?) -> String {
+        guard let m else { return ", this time only" }
+        let until = Date().addingTimeInterval(Double(m) * 60).formatted(date: .omitted, time: .shortened)
+        return " for the next \(m) minutes (until \(until)), without asking again"
     }
 
     /// `auto` is the prompt that starts by itself when a request appears; anything else is a click.
@@ -463,9 +491,10 @@ struct IslandView: View {
             }
             // A forwarded request was made on the other host; the local program only relays it.
             let who = s.via.map { "a program on \($0)" } ?? s.app
-            what = m.map { "let \(who) \(target) for \($0) minutes" } ?? "let \(who) \(target)"
+            what = "let \(who) \(target)" + duration(m)
         } else {
-            what = m.map { "allow \(r.title) for \(r.device) for \($0) minutes" } ?? "release \(r.title) to \(r.device)"
+            what = m == nil ? "release \(r.title) to \(r.device)" + duration(nil)
+                            : "allow \(r.title) for \(r.device)" + duration(m)
         }
         let ctx = LAContext()
         prompt = ctx

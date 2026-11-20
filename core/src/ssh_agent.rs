@@ -826,6 +826,18 @@ fn chain_of(mut pid: i32) -> Vec<String> {
     chain
 }
 
+/// What a request was, for the history of requests that never showed a card (auto, locked).
+pub fn about(a: &SignAsk) -> Value {
+    let app = a.via.first().map(|h| format!("forwarded from {h}"))
+        .or_else(|| a.peer.as_ref().map(Peer::name)).unwrap_or_else(|| "unknown program".into());
+    let (kind, title) = match (a.purpose.as_str(), &a.host) {
+        ("login", Some(h)) => ("login", a.user.as_ref().map_or(h.clone(), |u| format!("{u}@{h}"))),
+        ("git signing", _) => ("git", "Git commit".to_string()),
+        _ => ("other", "SSH signature".to_string()),
+    };
+    json!({"kind": kind, "title": title, "sub": format!("{} · {app}", a.key_name)})
+}
+
 pub fn ask_json(id: u64, a: &SignAsk) -> Value {
     json!({
         "ev": "ssh_request", "id": id,
